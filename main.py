@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Slot, QTimer
 from PySide6.QtGui import QFont
 from qasync import QEventLoop, asyncSlot
+from ollama import Client
 
 from Translator import OllamaProcessor
 
@@ -61,37 +62,38 @@ class ModularProcessorApp(QMainWindow):
         self.current_file_index = 0
         self.total_files = 0
         
-        # Schedule model fetch after event loop starts
-        QTimer.singleShot(100, lambda: asyncio.ensure_future(self.fetch_models()))
+        # Fetch models synchronously after UI is ready
+        QTimer.singleShot(100, self.fetch_models)
 
-    async def fetch_models(self):
+    def fetch_models(self):
         """Fetch available models from Ollama API"""
         try:
             ollama_host = self.config['app'].get('ollama_host', 'http://localhost:11434')
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{ollama_host}/api/tags") as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self.available_models = [model['name'] for model in data.get('models', [])]
-                        
-                        if self.available_models:
-                            # Update all model combos
-                            for op_id, widgets in self.operation_widgets.items():
-                                if 'model_combo' in widgets:
-                                    combo = widgets['model_combo']
-                                    combo.clear()
-                                    combo.addItem("(Use first operation's model)", None)
-                                    combo.addItems(self.available_models)
-                                    combo.setCurrentIndex(1)
-                            
-                            self.log_message(f"✓ Loaded {len(self.available_models)} models from Ollama")
-                        else:
-                            self.log_message("⚠️ No models found in Ollama")
-                    else:
-                        self.log_message(f"⚠️ Failed to fetch models: HTTP {response.status}")
+            client = Client(host=ollama_host)
+            
+            models_response = client.list()
+            
+            if hasattr(models_response, 'models'):
+                self.available_models = [model.model for model in models_response.models]
+            else:
+                self.available_models = []
+            
+            if self.available_models:
+                for op_id, widgets in self.operation_widgets.items():
+                    if 'model_combo' in widgets:
+                        combo = widgets['model_combo']
+                        combo.clear()
+                        combo.addItem("(Use first operation's model)", None)
+                        combo.addItems(self.available_models)
+                        if len(self.available_models) > 0:
+                            combo.setCurrentIndex(1)
+                
+                self.log_message(f"✓ Loaded {len(self.available_models)} models from Ollama")
+            else:
+                self.log_message("⚠️ No models found in Ollama")
+                
         except Exception as e:
             self.log_message(f"⚠️ Could not connect to Ollama: {e}")
-            # Add some default models as fallback
             self.available_models = [
                 "mistral:latest",
                 "llama3.2:latest",
