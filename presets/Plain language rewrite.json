@@ -1,0 +1,17 @@
+{
+  "enabled": [
+    "paraphrase"
+  ],
+  "chunk_size": 2500,
+  "overlap": 200,
+  "whole_file": false,
+  "ops": {
+    "paraphrase": {
+      "improve_flow": true,
+      "simplify_language": true,
+      "remove_idioms": true,
+      "target_tone": "original",
+      "temperature": 0.5
+    }
+  }
+}

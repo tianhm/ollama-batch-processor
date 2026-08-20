@@ -1,0 +1,29 @@
+{
+  "enabled": [
+    "translation",
+    "audiobook"
+  ],
+  "chunk_size": 2500,
+  "overlap": 200,
+  "whole_file": false,
+  "pipeline": [
+    "translation",
+    "audiobook",
+    "debookify",
+    "paraphrase"
+  ],
+  "ops": {
+    "translation": {
+      "source_language": "English",
+      "target_language": "Czech",
+      "temperature": 0.3
+    },
+    "audiobook": {
+      "transliterate_numerals": true,
+      "rewrite_abbreviations": true,
+      "normalize_punctuation": true,
+      "remove_visual_cues": true,
+      "temperature": 0.1
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "enabled": [
+    "translation"
+  ],
+  "chunk_size": 2500,
+  "overlap": 200,
+  "whole_file": false,
+  "ops": {
+    "translation": {
+      "source_language": "English",
+      "target_language": "Czech",
+      "temperature": 0.3
+    }
+  }
+}

@@ -1,263 +1,83 @@
-# Ollama Batch Processor 📚
+# ollama-batch-processor
 
-A powerful PySide6-based GUI application for batch processing text files using Ollama LLM models. Supports translation, audiobook formatting, and intelligent text paraphrasing with customizable pipeline operations.
+Run whole books through a **local LLM** with [Ollama](https://ollama.com): translate, prepare text for audiobook
+narration, strip book formatting, or paraphrase — chunk by chunk, file after file, with every step saved.
 
-## Features
+![ollama-batch-processor](thumb.png)
 
-- **🌐 Translation**: Professional translation between languages with context preservation
-- **🎧 Audiobook Formatting**: Optimize text for text-to-speech systems
-- **✍️ Paraphrasing**: Improve flow, simplify language, remove idioms, adjust tone
-- **📊 Pipeline Processing**: Chain multiple operations in custom order
-- **✂️ Smart Chunking**: Intelligent text splitting with overlap and boundary detection
-- **💾 Progressive Saving**: Each pipeline step saved to separate files
-- **🔄 Batch Processing**: Process multiple files sequentially
-- **🎯 Model Selection**: Use different Ollama models per operation
+## What it does
 
-## Requirements
+- **Queue** any number of `.txt` / `.md` / `.srt` / … files (or folders), press *Start*, get `name_processed.txt`
+  next to each source (or in a folder of your choice).
+- **Pipeline** of operations, run top to bottom — each with its own model and settings:
 
-- Python 3.8+
-- Ollama installed and running
-- At least one Ollama model installed
+  | Operation | |
+  |---|---|
+  | **Translation** | any language pair, meaning-first prompts with idiom handling; the end of the previous *translation* is fed back as context so names, terminology and register stay consistent across chunks |
+  | **Audiobook** | spell out numbers, expand abbreviations, normalise punctuation for speech pacing, remove visual-only formatting |
+  | **Debookify** | remove footnotes / page numbers / indexes, running headers & footers, normalise chapter headings |
+  | **Paraphrase** | improve flow, simplify language, remove idioms, shift tone (formal / casual / professional / conversational) |
 
-## Installation
+  All checked tasks of one operation are merged into a **single prompt**, so the text passes through the model once per operation.
+- **Smart chunking**: breaks at paragraph or sentence ends, configurable size / overlap or whole-file mode; the
+  Ollama context window (`num_ctx`) is sized automatically from the chunk so nothing is silently truncated.
+- **Progressive saving**: a `.partial` file grows chunk by chunk, each pipeline step is written to its own file,
+  Stop keeps what is finished. Duplicate paragraphs at chunk seams are removed.
+- **Robust output**: `<think>…</think>` blocks of reasoning models, "Here is the translation:" preambles, wrapping
+  quotes / code fences are stripped; a warning is logged when a chunk's output length is suspicious.
+- **Server panel**: URL, connection test, model list refresh, request timeout, keep-alive, `num_ctx` / `num_predict` / `top_p`.
+- **Presets** (menu): Translate EN→CS / CS→EN, Audiobook preparation, Book cleanup, Plain language rewrite,
+  Translate then audiobook — plus save / load / import / export your own and *save as defaults*.
+- Prompts and operations live in **`config.json`** next to the app (*File → Edit operations / prompts*): add your own
+  operation with options and a prompt and it shows up as a tab.
 
-### 1. Install Ollama
+## Install
 
-Download and install from [ollama.ai](https://ollama.ai)
+Grab a prebuilt binary from the [latest release](https://github.com/hclivess/ollama-batch-processor/releases/latest)
+(Windows / Linux / macOS, no Python needed), or run from source:
 
-```bash
-# Install a model
-ollama pull mistral
-# or
-ollama pull llama3.2
-ollama pull aya-expanse:32b
+```
+pip install -r requirements.txt
+python main.py            # run.cmd / run.sh do the same
 ```
 
-### 2. Install Python Dependencies
+You need a running Ollama with at least one model:
 
-```bash
-pip install PySide6 aiohttp qasync ollama
 ```
-
-### 3. Run the Application
-
-```bash
-# Start Ollama server (in separate terminal)
 ollama serve
-
-# Run the application
-python main.py
+ollama pull qwen2.5:14b   # or llama3.1, aya-expanse (great for translation), gemma3 ...
 ```
 
-## Configuration
+The server can be on another machine — put its URL in the *Server* tab.
 
-Edit `config.json` to customize:
+## Tips
 
-- **Ollama host**: Default `http://localhost:11434`
-- **Chunking presets**: Adjust chunk sizes and overlap
-- **Operation settings**: Modify prompts, icons, defaults
-- **UI settings**: Window size, titles
+- **Translation**: temperature 0.2–0.4, chunks of 2000–3000 chars, overlap 200. Bigger models translate
+  noticeably better; `aya-expanse` and `qwen2.5` are strong for European languages.
+- **Cleanup tasks** (audiobook / debookify): temperature 0.0–0.2, larger chunks (3000–4000), overlap 0.
+- **Slow CPU models**: set the request timeout to `none` in the *Server* tab.
+- **Out of memory**: reduce the chunk size (this shrinks `num_ctx`) or set `num_ctx` manually.
+- Output is `<name>_processed.txt`, steps are `<name>_processed_step01_translated.txt` etc.; existing files are
+  skipped unless *Overwrite* is on.
 
-## Usage
+## Build
 
-### Basic Workflow
+`pip install -r requirements.txt pyinstaller && python build.py` produces `dist/ollama-batch-processor-<version>-<os>-<arch>`.
+The GitHub workflow builds all three platforms on every tag and attaches them to the release; the Linux job installs
+Ollama, pulls `qwen2.5:0.5b` and runs a real translation through the frozen build
+(`OLLAMA_BATCH_SELFTEST=<text file>`).
 
-1. **Start Ollama**: Run `ollama serve` in a terminal
-2. **Launch App**: Run `python main.py`
-3. **Add Files**: Click "📁 Add File" and select .txt files
-4. **Configure Pipeline**:
-   - Check operations to enable (Translation, Audiobook, Paraphrase)
-   - Drag operations to reorder
-   - Configure each operation's settings
-5. **Select Models**: Choose Ollama model for each operation
-6. **Set Chunking**: Select preset or enable "Process entire file"
-7. **Start Processing**: Click "🚀 START"
-8. **Monitor Progress**: Watch Activity Log and progress bar
-9. **Access Outputs**: Find processed files and step files in output directory
+## Changes in 2.0
 
-### Translation
-
-- Set source and target languages
-- Handles idioms intelligently
-- Maintains consistency across chunks
-- Temperature: 0.2-0.4 recommended
-
-### Audiobook Formatting
-
-Enable options:
-- **Expand Contractions**: "don't" → "do not"
-- **Spell Out Numbers**: "123" → "one hundred twenty-three"
-- **Remove Special Characters**: Clean non-standard symbols
-- **Add Reading Markers**: Insert TTS-friendly markers
-
-### Paraphrasing
-
-Enable sub-operations:
-- **Improve Flow**: Better sentence structure and transitions
-- **Simplify Language**: Make complex text accessible
-- **Remove Idioms**: Convert figurative to literal language
-- **Adjust Tone**: Formal, casual, professional, or conversational
-
-### Chunking Settings
-
-**Presets**:
-- Fast (2000/150): Quick processing
-- Balanced (2500/200): Default, good quality
-- High Context (3000/250): Better continuity
-- Large (4000/300): Fewer API calls
-- Extra Large (6000/400): Maximum context
-
-**Process Entire File**: Disable chunking for small files (< 2500 chars)
-
-## Output Files
-
-The application creates multiple output files:
-
-```
-input.txt                          # Original file
-input_step_01_translated.txt       # After translation
-input_step_02_audiobook.txt        # After audiobook formatting
-input_processed.txt                # Final output
-```
-
-## Troubleshooting
-
-### "Nothing Happens" When Clicking Start
-
-**Check:**
-1. Is Ollama running? → `ollama serve`
-2. Is a model installed? → `ollama list`
-3. Did you add input files?
-4. Is at least one operation checked?
-5. Is a model selected in dropdown?
-
-### Connection Errors
-
-```bash
-# Test Ollama
-ollama list
-
-# If empty, install a model
-ollama pull mistral
-
-# Test inference
-ollama run mistral "hello"
-```
-
-### Model Not Loading
-
-Large models (30B+) take 1-2 minutes to load on first use. Watch console output for `[DEBUG]` messages.
-
-### Performance Tips
-
-- **Smaller chunks**: Faster processing, less context
-- **Larger chunks**: Slower but better quality
-- **Combined operations**: More efficient than separate runs
-- **Fast models**: Use smaller quantized models for speed
-- **GPU**: Ensure Ollama uses GPU for better performance
-
-## Advanced Configuration
-
-### Custom Prompts
-
-Edit `config.json` operation prompts:
-
-```json
-{
-  "operations": {
-    "translation": {
-      "prompts": {
-        "system_first": "Your custom system prompt...",
-        "user_first": "Your custom user prompt..."
-      }
-    }
-  }
-}
-```
-
-### Temperature Settings
-
-- **Translation**: 0.2-0.4 (deterministic)
-- **Paraphrasing**: 0.4-0.6 (creative)
-- **Creative Writing**: 0.7-1.0 (very creative)
-
-### Pipeline Order
-
-Operations execute in order from top to bottom. Typical workflows:
-
-1. **Translation → Audiobook**: Translate then optimize for TTS
-2. **Paraphrase → Simplify → Remove Idioms**: Multi-step text cleanup
-3. **Translation → Paraphrase (tone)**: Translate and adjust formality
-
-## Keyboard Shortcuts
-
-- **Ctrl+O**: Add files
-- **Ctrl+S**: Select output directory
-- **Ctrl+R**: Start processing
-- **Esc**: Stop processing
-
-## Diagnostic Tools
-
-### Test Ollama Connection
-
-```bash
-python test_ollama.py
-```
-
-Shows detailed connection diagnostics and model availability.
-
-### Debug Mode
-
-Console output shows `[DEBUG]` messages for:
-- Model calls with parameters
-- Response types and content length
-- Error tracebacks
-- Pipeline execution flow
-
-## Known Limitations
-
-- Only .txt files supported
-- No real-time progress within chunks (model inference time varies)
-- Large models require significant RAM/VRAM
-- Async operations prevent UI responsiveness during heavy processing
-
-## Tips for Best Results
-
-1. **Pre-process text**: Remove excessive whitespace, fix encoding
-2. **Use appropriate models**: Match model size to task complexity
-3. **Test with small files first**: Verify settings before batch processing
-4. **Monitor first chunk**: Shows model loading time and quality
-5. **Enable deduplication**: Removes duplicate paragraphs at chunk boundaries
-6. **Save intermediate steps**: Useful for debugging and iterative refinement
-
-## Architecture
-
-- **main.py**: PySide6 GUI and application logic
-- **Translator.py**: Ollama API interface and text processing
-- **config.json**: Configuration and prompts
-- **qasync**: Async event loop integration with Qt
-
-## License
-
-MIT License - feel free to modify and distribute.
-
-## Contributing
-
-Improvements welcome! Focus areas:
-- Additional operation types
-- Better error recovery
-- Real-time streaming output
-- Support for other file formats
-- Memory optimization for large files
-
-## Credits
-
-Built with:
-- [Ollama](https://ollama.ai) - Local LLM inference
-- [PySide6](https://doc.qt.io/qtforpython-6/) - Qt GUI framework
-- [qasync](https://github.com/CabbageDevelopment/qasync) - Qt async support
-
----
-
-**Version**: 1.0  
-**Last Updated**: October 2025
+- New GUI in the [whisperer](https://github.com/hclivess/whisperer) style: queue with per-file status, live chunk
+  progress and speed, log, presets menu, Server tab with connection test and model refresh
+- Streaming requests in a worker thread (no more qasync / aiohttp); **Stop** really stops, mid-chunk
+- Fixed: temperature was ignored for translation and passed raw (3.0 / 5.0!) to the other operations; `config.json`
+  and the stylesheet were loaded from the current directory (broke when started from elsewhere); errors were written
+  into the output as `[ERROR: …]` placeholders; the batch continued after Stop; output naming broke for non-`.txt` files;
+  no `num_ctx` was set, so long chunks were truncated by Ollama's default 2k context
+- Automatic context-window sizing, keep-alive, timeout, `<think>` stripping, wrapper/prefix cleanup, length sanity check
+- Translation continuation uses the previous translation (not the source) as context; chunk boundaries prefer
+  paragraph breaks; duplicate removal only affects substantial repeats
+- Input encoding detection (UTF-8 with BOM, UTF-16, cp1250/cp1252 fallback), overwrite guard, `.partial` progress file
+- Standalone builds for Windows / Linux / macOS via PyInstaller + GitHub Actions

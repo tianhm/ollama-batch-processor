@@ -1,0 +1,16 @@
+{
+  "enabled": [
+    "debookify"
+  ],
+  "chunk_size": 4000,
+  "overlap": 0,
+  "whole_file": false,
+  "ops": {
+    "debookify": {
+      "remove_elements": true,
+      "remove_headers_footers": true,
+      "normalize_chapters": true,
+      "temperature": 0.1
+    }
+  }
+}

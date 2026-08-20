@@ -1,0 +1,17 @@
+{
+  "enabled": [
+    "audiobook"
+  ],
+  "chunk_size": 3000,
+  "overlap": 0,
+  "whole_file": false,
+  "ops": {
+    "audiobook": {
+      "transliterate_numerals": true,
+      "rewrite_abbreviations": true,
+      "normalize_punctuation": true,
+      "remove_visual_cues": true,
+      "temperature": 0.1
+    }
+  }
+}

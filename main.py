@@ -1,959 +1,1021 @@
-import sys
-import os
-import asyncio
+#!/usr/bin/env python3
+"""
+ollama-batch-processor - run text files through an Ollama pipeline (translate / audiobook prep /
+book cleanup / paraphrase), chunk by chunk, with progressive saving.
+
+Set OLLAMA_BATCH_SELFTEST=<text file> for a headless smoke test (exits 0 when the server is unreachable
+but everything else works, and only after a real run when a server with a model is available).
+"""
 import json
-import aiohttp
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, 
-    QHBoxLayout, QLineEdit, QPushButton, QLabel, 
-    QProgressBar, QFileDialog, QComboBox, QMessageBox,
-    QGroupBox, QSpinBox, QDoubleSpinBox, QTextEdit, QCheckBox, QTabWidget,
-    QListWidget, QListWidgetItem
+import os
+import subprocess
+import sys
+import time
+import traceback
+from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QTextCursor  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
-from PySide6.QtCore import Qt, Slot, QTimer
-from PySide6.QtGui import QFont
-from qasync import QEventLoop, asyncSlot
-from ollama import Client
 
-from Translator import OllamaProcessor
+from config import (APP_NAME, APP_VERSION, CHUNK_PRESETS, DEFAULT_SETTINGS, TEXT_EXTENSIONS,  # noqa: E402
+                    WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH, app_dir, resource_dir)
+from processor import OllamaError, OllamaProcessor, ProcessingStopped, load_operations  # noqa: E402
+
+_BTN = """
+    QPushButton { font-size: 14px; font-weight: bold; padding: 8px; background-color: %s; color: %s; border-radius: 5px; }
+    QPushButton:hover { background-color: %s; }
+    QPushButton:disabled { background-color: #cccccc; color: #666; }
+"""
+_BAR = """
+    QProgressBar { border: 1px solid #c8c8c8; border-radius: 4px; background: #f0f0f0;
+                   text-align: center; height: 18px; font-weight: bold; color: #333; }
+    QProgressBar::chunk { background-color: %s; border-radius: 3px; }
+"""
+_STATUS_COLORS = {"pending": "#ffffff", "running": "#fff3cd", "done": "#d4edda", "failed": "#f8d7da",
+                  "stopped": "#e2e3e5", "skipped": "#e2e3e5"}
 
 
-class ModularProcessorApp(QMainWindow):
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# =============================================================================== threads
+class Worker(QThread):
+    log = Signal(str, str)
+    status = Signal(str)
+    file_started = Signal(int)
+    chunk_progress = Signal(int, int, str)
+    file_done = Signal(int, str, dict)
+    finished_all = Signal(int, int)
+
+    def __init__(self, files: List[str], settings: Dict, operations: Dict, pipeline):
+        super().__init__()
+        self.files, self.settings, self.operations, self.pipeline = files, settings, operations, pipeline
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        proc = OllamaProcessor(self.settings, self.operations, log=self.log.emit, status=self.status.emit,
+                               progress=self.chunk_progress.emit, should_stop=lambda: self._stop)
+        try:
+            proc.connect()
+            version = OllamaProcessor.server_version(self.settings["host"])
+            self.log.emit("INFO", f"Ollama {version} at {self.settings['host']}")
+        except Exception as exc:  # noqa: BLE001
+            self.log.emit("ERROR", f"Ollama server not reachable at {self.settings['host']}: {exc}")
+            for i in range(len(self.files)):
+                self.file_done.emit(i, "failed", {})
+            self.finished_all.emit(0, len(self.files))
+            return
+        ok = 0
+        for i, f in enumerate(self.files):
+            if self._stop:
+                self.file_done.emit(i, "stopped", {})
+                continue
+            self.file_started.emit(i)
+            try:
+                stats = proc.process_file(f, self.pipeline)
+                ok += 1
+                self.file_done.emit(i, "done", stats)
+            except ProcessingStopped:
+                self.log.emit("WARNING", f"{os.path.basename(f)}: stopped (finished chunks kept in .partial file)")
+                self.file_done.emit(i, "stopped", {})
+            except OllamaError as exc:
+                self.log.emit("ERROR", f"{os.path.basename(f)}: {exc}")
+                self.file_done.emit(i, "skipped" if "Output exists" in str(exc) else "failed", {})
+            except Exception as exc:  # noqa: BLE001
+                self.log.emit("ERROR", f"{os.path.basename(f)}: {exc}")
+                self.log.emit("DEBUG", traceback.format_exc())
+                self.file_done.emit(i, "failed", {})
+        self.finished_all.emit(ok, len(self.files))
+
+
+class ProbeThread(QThread):
+    done = Signal(str, list, str)        # version, models, error
+
+    def __init__(self, host: str):
+        super().__init__()
+        self.host = host
+
+    def run(self):
+        try:
+            version = OllamaProcessor.server_version(self.host)
+            models = OllamaProcessor.list_models(self.host)
+            self.done.emit(version, models, "")
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit("", [], str(exc))
+
+
+# =============================================================================== widgets
+class QueueTable(QTableWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__(0, 3)
+        self.setHorizontalHeaderLabels(["File", "Status", "Chunks"])
+        self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.verticalHeader().setVisible(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setAcceptDrops(True)
+        self.setStyleSheet("QTableWidget { border: 2px solid #aaa; border-radius: 5px; background: #f9f9f9; }")
+
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        e.accept() if e.mimeData().hasUrls() else e.ignore()
+
+    def dragMoveEvent(self, e):
+        e.accept() if e.mimeData().hasUrls() else e.ignore()
+
+    def dropEvent(self, e: QDropEvent):
+        if e.mimeData().hasUrls():
+            e.accept()
+            self.files_dropped.emit([u.toLocalFile() for u in e.mimeData().urls()])
+
+
+# =============================================================================== main window
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        
-        # Load configuration
-        try:
-            with open('config.json', 'r', encoding='utf-8') as f:
-                self.config = json.load(f)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load config.json: {e}")
-            sys.exit(1)
-        
-        # Set window properties from config
-        app_config = self.config.get('app', {})
-        self.setWindowTitle(app_config.get('title', 'Ollama Processor'))
-        window_size = app_config.get('window_size', {'width': 1100, 'height': 900})
-        self.setMinimumSize(window_size['width'], window_size['height'])
-        
-        # Processor instance
-        self.processor = OllamaProcessor(
-            ollama_host=app_config.get('ollama_host', 'http://localhost:11434'),
-            config=self.config
-        )
-        
-        # Store operation widgets and chunking widgets
-        self.operation_widgets = {}
-        self.chunking_widgets = {}
-        self.available_models = []
-        
-        # Initialize pipeline order based on config
-        operations = self.config.get('operations', {})
-        self.pipeline_order = sorted(operations.keys(), 
-                                     key=lambda x: operations[x].get('order', 999))
-        
-        self.setup_ui()
-        self.connect_signals()
-        self.apply_styles()
-        
-        self.input_files = []
-        self.output_directory = None
-        self.translation_start_time = None
-        self.current_file_index = 0
-        self.total_files = 0
-        
-        # Fetch models synchronously after UI is ready
-        QTimer.singleShot(100, self.fetch_models)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.resize(1180, 760)
+        self.qsettings = QSettings(APP_NAME, "Settings")
+        self.presets_dir = os.path.join(app_dir(), "presets")
+        os.makedirs(self.presets_dir, exist_ok=True)
+        self.operations = load_operations()
+        self.files: List[str] = []
+        self.worker: Optional[Worker] = None
+        self.probe: Optional[ProbeThread] = None
+        self.controls: Dict[str, QWidget] = {}          # global settings
+        self.op_controls: Dict[str, Dict[str, QWidget]] = {}   # per operation
+        self.models: List[str] = []
+        self._run_start = 0.0
+        self._chunks = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._build_ui()
+        self._build_menu()
+        self.apply_settings(dict(DEFAULT_SETTINGS))
+        self._load_persisted()
+        self.refresh_server()
 
-    def fetch_models(self):
-        """Fetch available models from Ollama API"""
-        try:
-            ollama_host = self.config['app'].get('ollama_host', 'http://localhost:11434')
-            client = Client(host=ollama_host)
-            
-            models_response = client.list()
-            
-            if hasattr(models_response, 'models'):
-                self.available_models = [model.model for model in models_response.models]
-            else:
-                self.available_models = []
-            
-            if self.available_models:
-                for op_id, widgets in self.operation_widgets.items():
-                    if 'model_combo' in widgets:
-                        combo = widgets['model_combo']
-                        combo.clear()
-                        combo.addItem("(Use first operation's model)", None)
-                        combo.addItems(self.available_models)
-                        if len(self.available_models) > 0:
-                            combo.setCurrentIndex(1)
-                
-                self.log_message(f"✓ Loaded {len(self.available_models)} models from Ollama")
-            else:
-                self.log_message("⚠️ No models found in Ollama")
-                
-        except Exception as e:
-            self.log_message(f"⚠️ Could not connect to Ollama: {e}")
-            self.available_models = [
-                "mistral:latest",
-                "llama3.2:latest",
-                "qwen2.5:latest"
-            ]
-            for op_id, widgets in self.operation_widgets.items():
-                if 'model_combo' in widgets:
-                    combo = widgets['model_combo']
-                    combo.clear()
-                    combo.addItem("(Use first operation's model)", None)
-                    combo.addItems(self.available_models)
-                    combo.setCurrentIndex(1)
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._left_panel())
+        split.addWidget(self._right_panel())
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([640, 520])
+        root.addWidget(split, 1)
+        self.statusBar().showMessage("Ready")
 
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(15)
-        main_layout.setContentsMargins(20, 20, 20, 20)
+    def _left_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(QLabel("<b>Queue</b> — drop text files or folders here"))
+        self.table = QueueTable()
+        self.table.files_dropped.connect(self.add_paths)
+        lay.addWidget(self.table, 3)
+        row = QHBoxLayout()
+        for text, fn in (("Add files", self.add_files), ("Add folder", self.add_folder),
+                         ("Remove", self.remove_selected), ("Clear", self.clear_queue)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        open_out = QPushButton("Open output folder")
+        open_out.clicked.connect(self.open_output)
+        row.addWidget(open_out)
+        lay.addLayout(row)
 
-        # Left side - Pipeline Order and Chunking
-        left_panel = QVBoxLayout()
-        left_panel.setSpacing(10)
-        
-        # Title
-        title_label = QLabel(self.config['app']['title'])
-        title_font = QFont()
-        title_font.setPointSize(18)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignCenter)
-        left_panel.addWidget(title_label)
+        prog = QGroupBox("Progress")
+        pl = QVBoxLayout(prog)
+        top = QHBoxLayout()
+        self.phase_label = QLabel("Idle")
+        self.phase_label.setStyleSheet("font-weight: bold;")
+        self.counter_label = QLabel("")
+        self.counter_label.setStyleSheet("color: #666;")
+        top.addWidget(self.phase_label, 1)
+        top.addWidget(self.counter_label)
+        pl.addLayout(top)
+        self.file_bar = QProgressBar()
+        self.file_bar.setStyleSheet(_BAR % "#4a90d9")
+        self.file_bar.setFormat("%v / %m chunks")
+        pl.addWidget(self.file_bar)
+        self.total_bar = QProgressBar()
+        self.total_bar.setStyleSheet(_BAR % "#28a745")
+        self.total_bar.setFormat("%v / %m files")
+        pl.addWidget(self.total_bar)
+        stats = QHBoxLayout()
+        self.stat_chunks = self._stat(stats, "chunks")
+        self.stat_speed = self._stat(stats, "speed")
+        self.stat_elapsed = self._stat(stats, "elapsed")
+        self.stat_server = self._stat(stats, "server")
+        pl.addLayout(stats)
+        lay.addWidget(prog)
 
-        # Pipeline Order Group
-        pipeline_group = QGroupBox("📋 Pipeline Order")
-        pipeline_layout = QVBoxLayout()
-        
-        info_label = QLabel("Drag to reorder, or use buttons.\nOnly enabled operations will run.")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666; font-style: italic; font-size: 10pt;")
-        pipeline_layout.addWidget(info_label)
-        
+        lay.addWidget(QLabel("<b>Log</b>"))
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("QTextEdit { font-family: monospace; font-size: 12px; background: #fcfcfc; }")
+        lay.addWidget(self.log, 2)
+
+        btns = QHBoxLayout()
+        self.start_btn = QPushButton("▶  Start")
+        self.start_btn.setStyleSheet(_BTN % ("#28a745", "white", "#218838"))
+        self.start_btn.clicked.connect(self.start)
+        self.stop_btn = QPushButton("■  Stop")
+        self.stop_btn.setStyleSheet(_BTN % ("#dc3545", "white", "#c82333"))
+        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setEnabled(False)
+        btns.addWidget(self.start_btn, 2)
+        btns.addWidget(self.stop_btn, 1)
+        lay.addLayout(btns)
+        return w
+
+    @staticmethod
+    def _stat(layout, caption) -> QLabel:
+        box = QVBoxLayout()
+        c = QLabel(caption)
+        c.setStyleSheet("color: #888; font-size: 10px;")
+        v = QLabel("--")
+        v.setStyleSheet("font-weight: bold; font-size: 13px;")
+        box.addWidget(c)
+        box.addWidget(v)
+        layout.addLayout(box)
+        return v
+
+    @staticmethod
+    def _wrap(widget: QWidget) -> QScrollArea:
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setWidget(widget)
+        sa.setFrameShape(QScrollArea.Shape.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        return sa
+
+    @staticmethod
+    def _hint(text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        lab.setStyleSheet("color: #666; font-size: 11px;")
+        return lab
+
+    def _right_panel(self) -> QWidget:
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._wrap(self._pipeline_tab()), "Pipeline")
+        for op_id, op in self.operations["operations"].items():
+            self.tabs.addTab(self._wrap(self._operation_tab(op_id, op)), op.get("tab_name", op_id.title()))
+        self.tabs.addTab(self._wrap(self._server_tab()), "Server")
+        all_controls = list(self.controls.values()) + [w for d in self.op_controls.values() for w in d.values()]
+        for w in all_controls:
+            if isinstance(w, QComboBox):
+                w.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+                w.setMinimumContentsLength(8)
+            if isinstance(w, (QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox)):
+                w.setMinimumWidth(0)
+                w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        return self.tabs
+
+    def _pipeline_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        c = self.controls
+        g = QGroupBox("Operations (checked ones run, top to bottom)")
+        gl = QVBoxLayout(g)
         self.pipeline_list = QListWidget()
-        self.pipeline_list.setDragDropMode(QListWidget.InternalMove)
-        self.pipeline_list.setDefaultDropAction(Qt.MoveAction)
-        self.pipeline_list.model().rowsMoved.connect(self.on_pipeline_reordered)
-        pipeline_layout.addWidget(self.pipeline_list)
-        
-        # Populate pipeline list
-        operations = self.config.get('operations', {})
-        for op_id in self.pipeline_order:
-            if op_id in operations:
-                op_config = operations[op_id]
-                icon = op_config.get('tab_icon', '')
-                name = op_config.get('tab_name', op_id.title())
-                item = QListWidgetItem(f"{icon} {name}")
-                item.setData(Qt.UserRole, op_id)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked)
-                self.pipeline_list.addItem(item)
-        
-        # Order buttons
-        btn_layout = QHBoxLayout()
-        self.move_up_btn = QPushButton("⬆️ Up")
-        self.move_down_btn = QPushButton("⬇️ Down")
-        self.move_up_btn.clicked.connect(self.move_operation_up)
-        self.move_down_btn.clicked.connect(self.move_operation_down)
-        btn_layout.addWidget(self.move_up_btn)
-        btn_layout.addWidget(self.move_down_btn)
-        pipeline_layout.addLayout(btn_layout)
-        
-        pipeline_group.setLayout(pipeline_layout)
-        left_panel.addWidget(pipeline_group)
-        
-        # Global Chunking Settings
-        chunking_group = QGroupBox("✂️ Chunking Settings (Global)")
-        chunking_layout = QVBoxLayout()
-        
-        # Process entire file checkbox
-        self.chunking_widgets['process_entire_file'] = QCheckBox("📄 Process entire file (no chunking)")
-        self.chunking_widgets['process_entire_file'].setToolTip("Process the entire file as a single chunk (ignores chunk size and overlap)")
-        self.chunking_widgets['process_entire_file'].setChecked(False)
-        self.chunking_widgets['process_entire_file'].stateChanged.connect(self.toggle_global_chunking)
-        chunking_layout.addWidget(self.chunking_widgets['process_entire_file'])
-        
-        # Preset combo
-        preset_layout = QHBoxLayout()
-        preset_layout.addWidget(QLabel("Preset:"))
-        self.chunking_widgets['preset_combo'] = QComboBox()
-        chunking_config = self.config.get('chunking', {})
-        presets = chunking_config.get('presets', [])
-        for preset in presets:
-            self.chunking_widgets['preset_combo'].addItem(preset['name'])
-        self.chunking_widgets['preset_combo'].setCurrentIndex(chunking_config.get('default_preset', 1))
-        self.chunking_widgets['preset_combo'].currentIndexChanged.connect(
-            lambda idx: self.update_global_chunk_preset(idx, presets)
-        )
-        preset_layout.addWidget(self.chunking_widgets['preset_combo'])
-        chunking_layout.addLayout(preset_layout)
-        
-        # Chunk size
-        chunk_layout = QHBoxLayout()
-        chunk_layout.addWidget(QLabel("Chunk:"))
-        self.chunking_widgets['chunk_size'] = QSpinBox()
-        self.chunking_widgets['chunk_size'].setRange(500, 50000)
-        self.chunking_widgets['chunk_size'].setValue(chunking_config.get('default_chunk_size', 2500))
-        self.chunking_widgets['chunk_size'].setSuffix(" chars")
-        self.chunking_widgets['chunk_size'].setToolTip("Maximum characters per processing chunk")
-        chunk_layout.addWidget(self.chunking_widgets['chunk_size'])
-        chunking_layout.addLayout(chunk_layout)
-        
-        # Overlap
-        overlap_layout = QHBoxLayout()
-        overlap_layout.addWidget(QLabel("Overlap:"))
-        self.chunking_widgets['overlap'] = QSpinBox()
-        self.chunking_widgets['overlap'].setRange(0, 2000)
-        self.chunking_widgets['overlap'].setValue(chunking_config.get('default_overlap', 200))
-        self.chunking_widgets['overlap'].setSuffix(" chars")
-        self.chunking_widgets['overlap'].setToolTip("Context overlap between chunks for consistency")
-        overlap_layout.addWidget(self.chunking_widgets['overlap'])
-        chunking_layout.addLayout(overlap_layout)
-        
-        chunking_group.setLayout(chunking_layout)
-        left_panel.addWidget(chunking_group)
-        
-        # File Selection Group
-        file_group = QGroupBox("📁 File Selection")
-        file_layout = QVBoxLayout()
-        
-        # Input files
-        input_header = QHBoxLayout()
-        input_header.addWidget(QLabel("Input Files:"))
-        input_header.addStretch()
-        self.add_files_btn = QPushButton("➕ Add Files")
-        self.add_files_btn.clicked.connect(self.add_input_files)
-        self.clear_files_btn = QPushButton("🗑️ Clear All")
-        self.clear_files_btn.clicked.connect(self.clear_input_files)
-        input_header.addWidget(self.add_files_btn)
-        input_header.addWidget(self.clear_files_btn)
-        file_layout.addLayout(input_header)
-        
-        # File list
-        self.input_files_list = QListWidget()
-        self.input_files_list.setMaximumHeight(120)
-        self.input_files_list.setSelectionMode(QListWidget.ExtendedSelection)
-        file_layout.addWidget(self.input_files_list)
-        
-        # File list buttons
-        list_btn_layout = QHBoxLayout()
-        self.remove_selected_btn = QPushButton("➖ Remove Selected")
-        self.remove_selected_btn.clicked.connect(self.remove_selected_files)
-        list_btn_layout.addWidget(self.remove_selected_btn)
-        list_btn_layout.addStretch()
-        file_layout.addLayout(list_btn_layout)
-        
-        # Output directory
-        output_layout = QHBoxLayout()
-        output_label = QLabel("Output Folder:")
-        output_label.setMinimumWidth(90)
-        output_layout.addWidget(output_label)
-        self.output_dir_edit = QLineEdit()
-        self.output_dir_edit.setPlaceholderText("Same as input files (auto)")
-        self.output_dir_edit.setReadOnly(True)
-        self.output_dir_btn = QPushButton("📂 Choose")
-        self.output_dir_btn.clicked.connect(self.select_output_directory)
-        self.output_dir_btn.setMinimumWidth(100)
-        output_layout.addWidget(self.output_dir_edit, 3)
-        output_layout.addWidget(self.output_dir_btn, 1)
-        file_layout.addLayout(output_layout)
-        
-        # File info label
-        self.file_info_label = QLabel("No files selected")
-        file_layout.addWidget(self.file_info_label)
-        
-        file_group.setLayout(file_layout)
-        left_panel.addWidget(file_group)
-        
-        left_panel.addStretch()
-        
-        # Right side - Settings and Progress
-        right_panel = QVBoxLayout()
-        right_panel.setSpacing(15)
+        self.pipeline_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.pipeline_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        for op_id, op in self.operations["operations"].items():
+            it = QListWidgetItem(op.get("tab_name", op_id.title()))
+            it.setData(Qt.ItemDataRole.UserRole, op_id)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            self.pipeline_list.addItem(it)
+        self.pipeline_list.setFixedHeight(self.pipeline_list.sizeHintForRow(0) * self.pipeline_list.count() + 8)
+        gl.addWidget(self.pipeline_list)
+        br = QHBoxLayout()
+        up, down = QPushButton("Move up"), QPushButton("Move down")
+        up.clicked.connect(lambda: self._move_op(-1))
+        down.clicked.connect(lambda: self._move_op(1))
+        br.addWidget(up)
+        br.addWidget(down)
+        br.addStretch()
+        gl.addLayout(br)
+        gl.addWidget(self._hint("Each operation's settings and model are on its own tab. Every file goes through the "
+                                "whole pipeline; each step is saved to its own file."))
+        lay.addWidget(g)
 
-        # Dynamic Settings Tabs
-        settings_group = QGroupBox("⚙️ Processing Settings")
-        settings_layout = QVBoxLayout()
-        
-        self.settings_tabs = QTabWidget()
-        
-        # Create tabs dynamically from config
-        operations = self.config.get('operations', {})
-        for op_id in self.pipeline_order:
-            if op_id in operations:
-                op_config = operations[op_id]
-                if op_config.get('enabled', True):
-                    tab = self.create_operation_tab(op_id, op_config)
-                    icon = op_config.get('tab_icon', '')
-                    name = op_config.get('tab_name', op_id.title())
-                    self.settings_tabs.addTab(tab, f"{icon} {name}")
-        
-        settings_layout.addWidget(self.settings_tabs)
-        settings_group.setLayout(settings_layout)
-        right_panel.addWidget(settings_group)
+        g2 = QGroupBox("Chunking")
+        f2 = QFormLayout(g2)
+        c["whole_file"] = QCheckBox("Process each file as a single chunk")
+        f2.addRow("", c["whole_file"])
+        self.chunk_preset = QComboBox()
+        self.chunk_preset.addItem("custom", None)
+        for name, (size, ov) in CHUNK_PRESETS.items():
+            self.chunk_preset.addItem(name, (size, ov))
+        self.chunk_preset.currentIndexChanged.connect(self._apply_chunk_preset)
+        f2.addRow("Preset:", self.chunk_preset)
+        c["chunk_size"] = QSpinBox()
+        c["chunk_size"].setRange(200, 100000)
+        c["chunk_size"].setSingleStep(100)
+        c["chunk_size"].setSuffix(" chars")
+        f2.addRow("Chunk size:", c["chunk_size"])
+        c["overlap"] = QSpinBox()
+        c["overlap"].setRange(0, 5000)
+        c["overlap"].setSingleStep(50)
+        c["overlap"].setSuffix(" chars")
+        c["overlap"].setToolTip("Tail of the previous result shown to the model for consistency")
+        c["chunk_size"].valueChanged.connect(self._sync_chunk_preset)
+        c["overlap"].valueChanged.connect(self._sync_chunk_preset)
+        f2.addRow("Context overlap:", c["overlap"])
+        c["deduplicate"] = QCheckBox("Remove duplicate paragraphs at chunk boundaries")
+        f2.addRow("", c["deduplicate"])
+        f2.addRow(self._hint("Chunks break at paragraph or sentence ends. Bigger chunks = more context but slower "
+                             "and needs more VRAM; the context window (num_ctx) is sized automatically."))
+        lay.addWidget(g2)
 
-        # Progress Group
-        progress_group = QGroupBox("📊 Processing Progress")
-        progress_layout = QVBoxLayout()
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setMinimumHeight(30)
-        progress_layout.addWidget(self.progress_bar)
-        
-        self.progress_label = QLabel("Ready to process. Ensure Ollama is running.")
-        self.progress_label.setWordWrap(True)
-        progress_layout.addWidget(self.progress_label)
-        
-        # Stats row
-        stats_layout = QHBoxLayout()
-        self.time_label = QLabel("Time: --:--")
-        self.chunks_label = QLabel("Chunks: 0/0")
-        self.speed_label = QLabel("Speed: -- chunks/min")
-        
-        stats_layout.addWidget(self.time_label)
-        stats_layout.addWidget(self.chunks_label)
-        stats_layout.addWidget(self.speed_label)
-        stats_layout.addStretch()
-        progress_layout.addLayout(stats_layout)
-        
-        progress_group.setLayout(progress_layout)
-        right_panel.addWidget(progress_group)
+        g3 = QGroupBox("Output")
+        f3 = QFormLayout(g3)
+        c["output_mode"] = QComboBox()
+        c["output_mode"].addItem("next to the source file", "same")
+        c["output_mode"].addItem("custom folder", "custom")
+        f3.addRow("Write to:", c["output_mode"])
+        c["output_dir"] = QLineEdit()
+        row = QHBoxLayout()
+        row.addWidget(c["output_dir"], 1)
+        b = QPushButton("…")
+        b.setFixedWidth(32)
+        b.clicked.connect(lambda: self._browse_dir(c["output_dir"]))
+        row.addWidget(b)
+        f3.addRow("Folder:", row)
+        c["suffix"] = QLineEdit()
+        f3.addRow("Suffix:", c["suffix"])
+        c["save_steps"] = QCheckBox("Save every pipeline step to its own file")
+        f3.addRow("", c["save_steps"])
+        c["overwrite"] = QCheckBox("Overwrite existing output")
+        f3.addRow("", c["overwrite"])
+        lay.addWidget(g3)
+        lay.addStretch()
+        return w
 
-        # Log Group
-        log_group = QGroupBox("📝 Activity Log")
-        log_layout = QVBoxLayout()
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
-        
-        log_group.setLayout(log_layout)
-        right_panel.addWidget(log_group)
+    def _operation_tab(self, op_id: str, op: Dict) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        ctl: Dict[str, QWidget] = {}
+        self.op_controls[op_id] = ctl
+        if op.get("description"):
+            lay.addWidget(self._hint(op["description"]))
+        g = QGroupBox("Model")
+        f = QFormLayout(g)
+        ctl["model"] = QComboBox()
+        ctl["model"].setEditable(True)
+        ctl["model"].setToolTip("Any model installed on the server (Server tab → Refresh). Type a name to use one that is not listed yet.")
+        f.addRow("Model:", ctl["model"])
+        lay.addWidget(g)
 
-        # Control Buttons
-        btn_layout = QHBoxLayout()
-        
-        self.start_btn = QPushButton("🚀 Start Processing")
-        self.start_btn.setObjectName("start_btn")
-        self.start_btn.clicked.connect(self.start_processing)
-        self.start_btn.setMinimumHeight(40)
-        
-        self.stop_btn = QPushButton("🛑 Stop")
-        self.stop_btn.setObjectName("stop_btn")
-        self.stop_btn.clicked.connect(self.stop_processing)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setMinimumHeight(40)
-        
-        btn_layout.addWidget(self.start_btn, 3)
-        btn_layout.addWidget(self.stop_btn, 1)
-        right_panel.addLayout(btn_layout)
-        
-        # Add panels to main layout
-        main_layout.addLayout(left_panel, 1)
-        main_layout.addLayout(right_panel, 2)
-        
-        # Timer for elapsed time
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_elapsed_time)
-        
-        self.log_message("Application started. Ready to process.")
-        self.log_message("ℹ️ Progressive saving enabled: Each step will be saved to a separate file")
-
-    def toggle_global_chunking(self, state: int):
-        """Enable/disable chunk size and overlap when process_entire_file is toggled"""
-        enabled = not bool(state)
-        self.chunking_widgets['chunk_size'].setEnabled(enabled)
-        self.chunking_widgets['overlap'].setEnabled(enabled)
-        self.chunking_widgets['preset_combo'].setEnabled(enabled)
-
-    def update_global_chunk_preset(self, index: int, presets: list):
-        """Update chunk size and overlap based on global preset selection"""
-        if index < len(presets):
-            preset = presets[index]
-            chunk_size = preset.get('chunk_size', 2500)
-            overlap = preset.get('overlap', 200)
-            
-            self.chunking_widgets['chunk_size'].blockSignals(True)
-            self.chunking_widgets['chunk_size'].setValue(chunk_size)
-            self.chunking_widgets['chunk_size'].blockSignals(False)
-            
-            self.chunking_widgets['overlap'].blockSignals(True)
-            self.chunking_widgets['overlap'].setValue(overlap)
-            self.chunking_widgets['overlap'].blockSignals(False)
-
-    def on_pipeline_reordered(self):
-        """Called when user drags to reorder pipeline"""
-        self.update_pipeline_order_from_list()
-
-    def move_operation_up(self):
-        """Move selected operation up in the pipeline"""
-        current_row = self.pipeline_list.currentRow()
-        if current_row > 0:
-            item = self.pipeline_list.takeItem(current_row)
-            self.pipeline_list.insertItem(current_row - 1, item)
-            self.pipeline_list.setCurrentRow(current_row - 1)
-            self.update_pipeline_order_from_list()
-
-    def move_operation_down(self):
-        """Move selected operation down in the pipeline"""
-        current_row = self.pipeline_list.currentRow()
-        if current_row < self.pipeline_list.count() - 1:
-            item = self.pipeline_list.takeItem(current_row)
-            self.pipeline_list.insertItem(current_row + 1, item)
-            self.pipeline_list.setCurrentRow(current_row + 1)
-            self.update_pipeline_order_from_list()
-
-    def update_pipeline_order_from_list(self):
-        """Update internal pipeline order from list widget"""
-        new_order = []
-        for i in range(self.pipeline_list.count()):
-            item = self.pipeline_list.item(i)
-            op_id = item.data(Qt.UserRole)
-            new_order.append(op_id)
-        self.pipeline_order = new_order
-        self.log_message(f"Pipeline order updated: {' → '.join([self.config['operations'][op]['tab_icon'] for op in new_order])}")
-
-    def create_operation_tab(self, op_id: str, op_config: dict) -> QWidget:
-        """Dynamically create a tab based on operation config"""
-        widget = QWidget()
-        layout = QVBoxLayout()
-        
-        # Store widgets for this operation
-        self.operation_widgets[op_id] = {}
-        
-        # Description if available
-        if 'description' in op_config:
-            desc_label = QLabel(op_config['description'])
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #666; font-style: italic;")
-            layout.addWidget(desc_label)
-        
-        # Create options dynamically
-        options = op_config.get('options', {})
-        
-        for option_id, option_config in options.items():
-            option_type = option_config.get('type')
-            
-            if option_type == 'text':
-                row = QHBoxLayout()
-                row.addWidget(QLabel(option_config.get('label', option_id)))
-                edit = QLineEdit(option_config.get('default', ''))
-                edit.setMinimumHeight(24)
-                if 'width' in option_config:
-                    edit.setMaximumWidth(option_config['width'])
-                if 'tooltip' in option_config:
-                    edit.setToolTip(option_config['tooltip'])
-                row.addWidget(edit)
-                row.addStretch()
-                layout.addLayout(row)
-                self.operation_widgets[op_id][option_id] = edit
-                
-            elif option_type == 'combo':
-                row = QHBoxLayout()
-                row.addWidget(QLabel(option_config.get('label', option_id)))
-                combo = QComboBox()
-                combo_options = option_config.get('options', [])
-                for opt in combo_options:
-                    combo.addItem(opt.get('name', opt))
-                combo.setCurrentIndex(option_config.get('default_index', 0))
-                if 'tooltip' in option_config:
-                    combo.setToolTip(option_config['tooltip'])
-                
-                row.addWidget(combo)
-                row.addStretch()
-                layout.addLayout(row)
-                self.operation_widgets[op_id][option_id] = combo
-                
-            elif option_type == 'spinbox':
-                row = QHBoxLayout()
-                row.addWidget(QLabel(option_config.get('label', option_id)))
-                spinbox = QSpinBox()
-                
-                # Check if this is a decimal spinbox
-                if option_config.get('decimal', False):
-                    from PySide6.QtWidgets import QDoubleSpinBox
-                    spinbox = QDoubleSpinBox()
-                    spinbox.setDecimals(option_config.get('decimals', 1))
-                    spinbox.setSingleStep(option_config.get('single_step', 0.1))
+        g2 = QGroupBox("Options")
+        f2 = QFormLayout(g2)
+        for oid, o in op.get("options", {}).items():
+            t = o.get("type")
+            label = o.get("label", oid)
+            if t == "text":
+                wd = QLineEdit(str(o.get("default", "")))
+            elif t == "combo":
+                wd = QComboBox()
+                for item in o.get("options", []):
+                    wd.addItem(item.get("name", str(item)), item.get("value") if isinstance(item, dict) else item)
+                wd.setCurrentIndex(int(o.get("default_index", 0)))
+            elif t == "spinbox":
+                if o.get("decimal"):
+                    wd = QDoubleSpinBox()
+                    wd.setDecimals(int(o.get("decimals", 2)))
+                    wd.setSingleStep(float(o.get("single_step", 0.1)))
                 else:
-                    spinbox.setSingleStep(option_config.get('step', 1))
-                
-                spinbox.setRange(option_config.get('min', 0), option_config.get('max', 100000))
-                spinbox.setValue(option_config.get('default', 0))
-                if 'suffix' in option_config:
-                    spinbox.setSuffix(option_config['suffix'])
-                if 'tooltip' in option_config:
-                    spinbox.setToolTip(option_config['tooltip'])
-                row.addWidget(spinbox)
-                row.addStretch()
-                layout.addLayout(row)
-                self.operation_widgets[op_id][option_id] = spinbox
-                
-            elif option_type == 'checkbox':
-                checkbox = QCheckBox(option_config.get('label', option_id))
-                checkbox.setChecked(option_config.get('default', False))
-                if 'tooltip' in option_config:
-                    checkbox.setToolTip(option_config['tooltip'])
-                
-                layout.addWidget(checkbox)
-                self.operation_widgets[op_id][option_id] = checkbox
-        
-        # Add model selector if operation requires it
-        if op_config.get('requires_model', False):
-            model_layout = QHBoxLayout()
-            model_layout.addWidget(QLabel("Model:"))
-            model_combo = QComboBox()
-            model_combo.addItem("(Use first operation's model)", None)
-            model_combo.setMinimumWidth(150)
-            model_layout.addWidget(model_combo)
-            model_layout.addStretch()
-            layout.addLayout(model_layout)
-            self.operation_widgets[op_id]['model_combo'] = model_combo
-        
-        layout.addStretch()
-        widget.setLayout(layout)
-        return widget
-
-    def apply_styles(self):
-        """Apply global styles to the application"""
-        try:
-            with open('styles.qss', 'r') as f:
-                style_sheet = f.read()
-                self.setStyleSheet(style_sheet)
-        except Exception as e:
-            print(f"Warning: Could not load styles.qss: {e}")
-
-    def connect_signals(self):
-        """Connects the processor's signals to the GUI's slots."""
-        self.processor.processing_progress.connect(self.update_progress)
-        self.processor.processing_finished.connect(self.processing_finished)
-        self.processor.processing_error.connect(self.display_error)
-        self.processor.step_status.connect(self.update_step_status)
-        self.processor.step_saved.connect(self.on_step_saved)
-    
-    @Slot(str)
-    def on_step_saved(self, file_path: str):
-        """Called when a processing step is saved"""
-        filename = os.path.basename(file_path)
-        self.log_message(f"💾 Step saved: {filename}")
-    
-    @Slot()
-    def add_input_files(self):
-        file_names, _ = QFileDialog.getOpenFileNames(
-            self, 
-            "Select Input Files", 
-            "", 
-            "Text Files (*.txt);;All Files (*)"
-        )
-        if file_names:
-            for file_name in file_names:
-                if file_name not in self.input_files:
-                    self.input_files.append(file_name)
-                    self.input_files_list.addItem(os.path.basename(file_name))
-            
-            self.update_file_info()
-            self.log_message(f"Added {len(file_names)} file(s). Total: {len(self.input_files)}")
-    
-    @Slot()
-    def clear_input_files(self):
-        self.input_files.clear()
-        self.input_files_list.clear()
-        self.file_info_label.setText("No files selected")
-        self.log_message("Cleared all input files")
-    
-    @Slot()
-    def remove_selected_files(self):
-        selected_items = self.input_files_list.selectedItems()
-        if not selected_items:
-            return
-        
-        for item in selected_items:
-            row = self.input_files_list.row(item)
-            self.input_files_list.takeItem(row)
-            if row < len(self.input_files):
-                removed_file = self.input_files.pop(row)
-                self.log_message(f"Removed: {os.path.basename(removed_file)}")
-        
-        self.update_file_info()
-    
-    @Slot()
-    def select_output_directory(self):
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Select Output Directory",
-            ""
-        )
-        if directory:
-            self.output_directory = directory
-            self.output_dir_edit.setText(directory)
-            self.log_message(f"Output directory: {directory}")
-    
-    def update_file_info(self):
-        """Update file info label with statistics"""
-        if not self.input_files:
-            self.file_info_label.setText("No files selected")
-            return
-        
-        total_size = 0
-        total_words = 0
-        total_chars = 0
-        
-        for file_path in self.input_files:
-            try:
-                file_size = os.path.getsize(file_path)
-                total_size += file_size
-                
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    total_words += len(content.split())
-                    total_chars += len(content)
-            except:
-                pass
-        
-        size_kb = total_size / 1024
-        self.file_info_label.setText(
-            f"📄 {len(self.input_files)} file(s) | {size_kb:.1f} KB | {total_words:,} words | {total_chars:,} characters"
-        )
-
-    @asyncSlot() 
-    async def start_processing(self):
-        self.log_message("=" * 60)
-        self.log_message("🚀 START PROCESSING CLICKED")
-        self.log_message("=" * 60)
-        
-        if not self.input_files:
-            self.log_message("❌ ERROR: No input files selected")
-            QMessageBox.warning(self, "Warning", "Please select at least one input file.")
-            return
-
-        self.log_message(f"✓ Input files: {len(self.input_files)}")
-        for i, f in enumerate(self.input_files, 1):
-            self.log_message(f"  {i}. {os.path.basename(f)}")
-        
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("Initializing processing...")
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        
-        self.log_message("⚙️ Reading chunking settings...")
-        # Get global chunking settings
-        global_chunk_size = self.chunking_widgets['chunk_size'].value()
-        global_overlap = self.chunking_widgets['overlap'].value()
-        process_entire_file = self.chunking_widgets['process_entire_file'].isChecked()
-        
-        self.log_message(f"✓ Chunk size: {global_chunk_size}")
-        self.log_message(f"✓ Overlap: {global_overlap}")
-        self.log_message(f"✓ Process entire file: {process_entire_file}")
-        
-        # Override if process entire file is checked
-        if process_entire_file:
-            global_chunk_size = -1
-            global_overlap = 0
-            self.log_message("→ Overriding: Will process entire file")
-        
-        self.log_message("🔨 Building pipeline...")
-        # Build pipeline from UI order
-        pipeline = []
-        operations = self.config.get('operations', {})
-        first_model = None
-        
-        # Get the order from the list widget
-        for i in range(self.pipeline_list.count()):
-            item = self.pipeline_list.item(i)
-            op_id = item.data(Qt.UserRole)
-            
-            # Skip if not checked/enabled
-            if item.checkState() != Qt.Checked:
-                continue
-            
-            op_config = operations.get(op_id)
-            if not op_config or not op_config.get('enabled', True):
-                continue
-            
-            widgets = self.operation_widgets.get(op_id, {})
-            op_settings = {
-                'operation_id': op_id, 
-                'config': op_config,
-                'chunk_size': global_chunk_size,
-                'overlap': global_overlap
-            }
-            
-            # Check if this operation should be executed
-            should_execute = False
-            
-            # Collect all option values
-            for option_id, widget in widgets.items():
-                if option_id == 'model_combo':
-                    continue
-                
-                if isinstance(widget, QLineEdit):
-                    op_settings[option_id] = widget.text()
-                elif isinstance(widget, QComboBox):
-                    op_settings[option_id] = widget.currentIndex()
-                elif isinstance(widget, QSpinBox) or isinstance(widget, QDoubleSpinBox):
-                    op_settings[option_id] = widget.value()
-                elif isinstance(widget, QCheckBox):
-                    checked = widget.isChecked()
-                    op_settings[option_id] = checked
-                    if checked:
-                        should_execute = True
-            
-            # Special handling for target_tone combo box in paraphrase operation
-            if op_id == 'paraphrase' and 'target_tone' in widgets:
-                tone_index = op_settings.get('target_tone', 0)
-                tone_options = op_config['options']['target_tone']['options']
-                
-                if tone_index > 0 and tone_index < len(tone_options):
-                    tone_value = tone_options[tone_index].get('value')
-                    
-                    # Map tone selection to the appropriate sub-operation
-                    tone_mapping = {
-                        'formal': 'adjust_tone_formal',
-                        'casual': 'adjust_tone_casual',
-                        'professional': 'adjust_tone_professional',
-                        'conversational': 'adjust_tone_conversational'
-                    }
-                    
-                    if tone_value in tone_mapping:
-                        sub_op = tone_mapping[tone_value]
-                        op_settings[sub_op] = True
-                        should_execute = True
-            
-            # Get model selection
-            if 'model_combo' in widgets:
-                combo = widgets['model_combo']
-                
-                if combo.currentIndex() == 0:
-                    # "(Use first operation's model)" selected
-                    if first_model is None:
-                        # This IS the first model, use the next selection
-                        if combo.count() > 1:
-                            op_settings['model'] = combo.itemText(1)
-                            first_model = op_settings['model']
-                        else:
-                            op_settings['model'] = self.available_models[0] if self.available_models else 'mistral:latest'
-                            first_model = op_settings['model']
-                    else:
-                        op_settings['model'] = first_model
-                else:
-                    # Specific model selected
-                    op_settings['model'] = combo.currentText()
-                    if first_model is None:
-                        first_model = op_settings['model']
-            
-            # For translation, always execute. For others, check if any sub-operation is enabled
-            if op_id == 'translation' or should_execute:
-                pipeline.append(op_settings)
-        
-        if not pipeline:
-            QMessageBox.warning(self, "Warning", "No operations enabled. Please check at least one operation in the pipeline list.")
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            return
-        
-        # Start timer
-        self.translation_start_time = asyncio.get_event_loop().time()
-        self.timer.start(1000)
-        
-        self.total_files = len(self.input_files)
-        self.current_file_index = 0
-        
-        self.log_message("=" * 50)
-        self.log_message(f"Starting batch processing: {self.total_files} file(s)")
-        self.log_message(f"Pipeline: {len(pipeline)} operation(s)")
-        
-        if process_entire_file:
-            self.log_message("📄 Mode: Processing entire file (no chunking)")
-        else:
-            self.log_message(f"✂️ Chunking: {global_chunk_size} chars, {global_overlap} overlap")
-        
-        for op_settings in pipeline:
-            op_id = op_settings['operation_id']
-            op_config = op_settings['config']
-            self.log_message(f"✓ {op_config.get('tab_icon', '')} {op_config.get('tab_name', op_id)}")
-            if 'model' in op_settings:
-                self.log_message(f"  Model: {op_settings['model']}")
-        
-        self.log_message("📁 Progressive file saving: Each step will create its own file")
-        self.log_message("=" * 50)
-        
-        # Process each file
-        for idx, input_file in enumerate(self.input_files):
-            self.current_file_index = idx + 1
-            
-            # Determine output path
-            if self.output_directory:
-                output_file = os.path.join(
-                    self.output_directory,
-                    os.path.basename(input_file).replace('.txt', '_processed.txt')
-                )
+                    wd = QSpinBox()
+                    wd.setSingleStep(int(o.get("step", 1)))
+                wd.setRange(o.get("min", 0), o.get("max", 100000))
+                wd.setValue(o.get("default", 0))
+                if o.get("suffix"):
+                    wd.setSuffix(o["suffix"])
+            elif t == "checkbox":
+                wd = QCheckBox(label)
+                wd.setChecked(bool(o.get("default", False)))
+                label = ""
             else:
-                base, ext = os.path.splitext(input_file)
-                output_file = f"{base}_processed{ext}"
-            
-            self.log_message(f"\n📄 Processing file {self.current_file_index}/{self.total_files}: {os.path.basename(input_file)}")
-            self.progress_label.setText(f"File {self.current_file_index}/{self.total_files}: {os.path.basename(input_file)}")
-            
-            print(f"\n[DEBUG] ===== STARTING FILE PROCESSING =====")
-            print(f"[DEBUG] File: {input_file}")
-            print(f"[DEBUG] Output: {output_file}")
-            print(f"[DEBUG] Pipeline operations: {len(pipeline)}")
-            for op in pipeline:
-                print(f"[DEBUG]   - {op['operation_id']}: model={op.get('model', 'N/A')}")
-            
-            # Process this file
-            print(f"[DEBUG] Calling processor.process_pipeline()...")
-            await self.processor.process_pipeline(
-                input_file,
-                output_file,
-                pipeline
-            )
-        
-        # Processing complete for all files
-        if self.processor.is_running:
-            self.timer.stop()
-            elapsed = asyncio.get_event_loop().time() - self.translation_start_time
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            
-            self.progress_label.setText(
-                f"✅ Batch Complete! {self.total_files} file(s) processed. Time: {minutes:02d}:{seconds:02d}"
-            )
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            
-            self.log_message("=" * 50)
-            self.log_message(f"✅ Batch processing completed!")
-            self.log_message(f"Files processed: {self.total_files}")
-            self.log_message(f"Total time: {minutes:02d}:{seconds:02d}")
-            
-            QMessageBox.information(
-                self, 
-                "Success", 
-                f"Batch processing complete!\n\nFiles: {self.total_files}\nTime: {minutes:02d}:{seconds:02d}"
-            )
+                continue
+            if o.get("tooltip"):
+                wd.setToolTip(o["tooltip"])
+            f2.addRow(label, wd)
+            ctl[oid] = wd
+        lay.addWidget(g2)
+        if op.get("sub_operations"):
+            lay.addWidget(self._hint("All checked tasks are merged into one prompt, so the text passes through the model once."))
+        lay.addStretch()
+        return w
 
-    @Slot(int, int, str)
-    def update_progress(self, current: int, total: int, phase: str):
-        percentage = int((current / total) * 100) if total > 0 else 0
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
-        
-        self.progress_label.setText(f"{phase}: {current}/{total} ({percentage}%)")
-        self.chunks_label.setText(f"Chunks: {current}/{total}")
-        
-        # Calculate speed
-        if self.translation_start_time and current > 0:
-            elapsed = asyncio.get_event_loop().time() - self.translation_start_time
-            speed = (current / elapsed) * 60
-            self.speed_label.setText(f"Speed: {speed:.1f} chunks/min")
-        
-        if current % 5 == 0 or current == total:
-            self.log_message(f"Progress: {current}/{total} chunks ({percentage}%)")
+    def _server_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        c = self.controls
+        g = QGroupBox("Ollama server")
+        f = QFormLayout(g)
+        c["host"] = QLineEdit()
+        c["host"].setPlaceholderText("http://localhost:11434")
+        c["host"].editingFinished.connect(self.refresh_server)
+        f.addRow("URL:", c["host"])
+        row = QHBoxLayout()
+        self.server_label = self._hint("")
+        self.server_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        refresh = QPushButton("Test connection / refresh models")
+        refresh.clicked.connect(self.refresh_server)
+        row.addWidget(self.server_label, 1)
+        row.addWidget(refresh)
+        f.addRow(row)
+        c["timeout"] = QSpinBox()
+        c["timeout"].setRange(0, 7200)
+        c["timeout"].setSuffix(" s")
+        c["timeout"].setSpecialValueText("none")
+        c["timeout"].setToolTip("Per-request timeout; 0 = wait forever (slow models on CPU can take minutes per chunk)")
+        f.addRow("Request timeout:", c["timeout"])
+        c["keep_alive"] = QLineEdit()
+        c["keep_alive"].setToolTip("How long the model stays loaded after the last request, e.g. 10m, 1h, -1 = forever")
+        f.addRow("Keep model loaded:", c["keep_alive"])
+        lay.addWidget(g)
 
-    @Slot(str)
-    def update_step_status(self, status: str):
-        """Update the UI when step status changes"""
-        self.progress_label.setText(status)
-        self.log_message(status)
+        g2 = QGroupBox("Generation")
+        f2 = QFormLayout(g2)
+        c["num_ctx"] = QSpinBox()
+        c["num_ctx"].setRange(0, 262144)
+        c["num_ctx"].setSingleStep(1024)
+        c["num_ctx"].setSpecialValueText("auto")
+        c["num_ctx"].setToolTip("Context window in tokens. auto = sized from the chunk (prompt + answer)")
+        f2.addRow("Context (num_ctx):", c["num_ctx"])
+        c["num_predict"] = QSpinBox()
+        c["num_predict"].setRange(-1, 262144)
+        c["num_predict"].setSpecialValueText("unlimited")
+        f2.addRow("Max tokens:", c["num_predict"])
+        c["top_p"] = QDoubleSpinBox()
+        c["top_p"].setRange(0.0, 1.0)
+        c["top_p"].setSingleStep(0.05)
+        f2.addRow("top_p:", c["top_p"])
+        c["strip_thinking"] = QCheckBox("Strip <think>…</think> blocks from reasoning models")
+        f2.addRow("", c["strip_thinking"])
+        lay.addWidget(g2)
+        lay.addStretch()
+        return w
 
-    def update_elapsed_time(self):
-        """Update the elapsed time display"""
-        if self.translation_start_time:
-            elapsed = asyncio.get_event_loop().time() - self.translation_start_time
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            self.time_label.setText(f"Time: {minutes:02d}:{seconds:02d}")
+    def _build_menu(self):
+        mb = self.menuBar()
+        fm = mb.addMenu("&File")
+        fm.addAction("Add files…", self.add_files, "Ctrl+O")
+        fm.addAction("Add folder…", self.add_folder, "Ctrl+Shift+O")
+        fm.addAction("Open output folder", self.open_output)
+        fm.addAction("Edit operations / prompts (config.json)", self.open_config)
+        fm.addSeparator()
+        fm.addAction("Exit", self.close, "Ctrl+Q")
+        self.presets_menu = mb.addMenu("&Presets")
+        self._rebuild_presets_menu()
+        hm = mb.addMenu("&Help")
+        hm.addAction("About", self._about)
 
-    @Slot(str)
-    def processing_finished(self, output_path: str):
-        """Called when a single file finishes processing"""
-        # Don't stop timer or show final message if we're in batch mode
-        if self.current_file_index < self.total_files:
-            self.log_message(f"✅ Completed: {os.path.basename(output_path)}")
-            return
-        
-        # This was the last file
-        self.timer.stop()
-        elapsed = asyncio.get_event_loop().time() - self.translation_start_time
-        minutes = int(elapsed // 60)
-        seconds = int(elapsed % 60)
-        
-        self.progress_label.setText(
-            f"✅ Processing Complete! Time: {minutes:02d}:{seconds:02d}"
-        )
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        
-        self.log_message("=" * 50)
-        self.log_message(f"✅ Processing completed successfully!")
-        self.log_message(f"Total time: {minutes:02d}:{seconds:02d}")
-        self.log_message(f"Output: {os.path.basename(output_path)}")
-        
-        # List all step files created for the last file
-        base, ext = os.path.splitext(output_path)
-        self.log_message("📁 Step files created:")
-        
-        step_files = []
-        for filename in os.listdir(os.path.dirname(output_path) or '.'):
-            if filename.startswith(os.path.basename(base) + "_step_"):
-                step_files.append(filename)
-        
-        for step_file in sorted(step_files):
-            self.log_message(f"  • {step_file}")
-    
-    @Slot(str)
-    def display_error(self, message: str):
-        self.timer.stop()
-        self.progress_label.setText(f"❌ Error: {message}")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        
-        self.log_message(f"❌ ERROR: {message}")
-        QMessageBox.critical(self, "Error", message)
+    def _rebuild_presets_menu(self):
+        m = self.presets_menu
+        m.clear()
+        names = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        for name in names:
+            m.addAction(name, lambda n=name: self._load_preset_file(os.path.join(self.presets_dir, n + ".json")))
+        if names:
+            m.addSeparator()
+        m.addAction("Save preset…", self._save_preset)
+        m.addAction("Delete preset…", self._delete_preset)
+        m.addAction("Import preset…", self._import_preset)
+        m.addAction("Export preset…", self._export_preset)
+        m.addSeparator()
+        m.addAction("Save current settings as defaults", self._save_defaults)
+        m.addAction("Reset to factory defaults", lambda: self.apply_settings(dict(DEFAULT_SETTINGS)))
 
-    @Slot()
-    def stop_processing(self):
-        self.timer.stop()
-        self.processor.stop_processing()
-        self.progress_label.setText("🛑 Processing stopped by user.")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        
-        self.log_message("🛑 Processing stopped by user")
+    # ------------------------------------------------------------- settings io
+    @staticmethod
+    def _read_widget(w):
+        if isinstance(w, QCheckBox):
+            return w.isChecked()
+        if isinstance(w, QComboBox):
+            data = w.currentData()
+            return w.currentText().strip() if w.isEditable() or data is None else data
+        if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            return w.value()
+        if isinstance(w, QLineEdit):
+            return w.text().strip()
+        return None
 
-    def log_message(self, message: str):
-        """Add a message to the activity log"""
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
+    @staticmethod
+    def _write_widget(w, v):
+        try:
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(v))
+            elif isinstance(w, QComboBox):
+                idx = w.findData(v)
+                if idx < 0:
+                    idx = w.findText(str(v))
+                if idx >= 0:
+                    w.setCurrentIndex(idx)
+                elif w.isEditable():
+                    w.setCurrentText(str(v))
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                w.setValue(v)
+            elif isinstance(w, QLineEdit):
+                w.setText("" if v is None else str(v))
+        except Exception:
+            pass
+
+    def get_settings(self) -> Dict:
+        s = {k: self._read_widget(w) for k, w in self.controls.items()}
+        order, enabled = [], []
+        for i in range(self.pipeline_list.count()):
+            it = self.pipeline_list.item(i)
+            order.append(it.data(Qt.ItemDataRole.UserRole))
+            if it.checkState() == Qt.CheckState.Checked:
+                enabled.append(order[-1])
+        s["pipeline"], s["enabled"] = order, enabled
+        s["ops"] = {op: {k: self._read_widget(w) for k, w in ctl.items()} for op, ctl in self.op_controls.items()}
+        return s
+
+    def apply_settings(self, s: Dict):
+        for k, w in self.controls.items():
+            if k in s:
+                self._write_widget(w, s[k])
+        if "pipeline" in s:
+            items = {}
+            for i in range(self.pipeline_list.count()):
+                it = self.pipeline_list.item(i)
+                items[it.data(Qt.ItemDataRole.UserRole)] = it
+            order = [o for o in s["pipeline"] if o in items] + [o for o in items if o not in s["pipeline"]]
+            for it in items.values():
+                self.pipeline_list.takeItem(self.pipeline_list.row(it))
+            for o in order:
+                self.pipeline_list.addItem(items[o])
+        if "enabled" in s:
+            for i in range(self.pipeline_list.count()):
+                it = self.pipeline_list.item(i)
+                on = it.data(Qt.ItemDataRole.UserRole) in s["enabled"]
+                it.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+        for op, vals in (s.get("ops") or {}).items():
+            for k, v in vals.items():
+                if k in self.op_controls.get(op, {}):
+                    self._write_widget(self.op_controls[op][k], v)
+        self._sync_chunk_preset()
+
+    def _load_persisted(self):
+        d = os.path.join(self.presets_dir, "defaults.json")
+        if os.path.isfile(d):
+            try:
+                with open(d, encoding="utf-8") as fh:
+                    self.apply_settings(json.load(fh))
+            except Exception:
+                pass
+        raw = self.qsettings.value("settings")
+        if raw:
+            try:
+                self.apply_settings(json.loads(raw))
+            except Exception:
+                pass
+        geo = self.qsettings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
 
     def closeEvent(self, event):
-        self.processor.stop_processing()
-        self.timer.stop()
+        if self.worker and self.worker.isRunning():
+            if QMessageBox.question(self, "Quit", "Processing is running. Stop and quit?") != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.worker.request_stop()
+            self.worker.wait(5000)
+        self.qsettings.setValue("settings", json.dumps(self.get_settings()))
+        self.qsettings.setValue("geometry", self.saveGeometry())
         event.accept()
+
+    # ---------------------------------------------------------------- presets
+    def _write_json(self, path: str, data: Dict) -> bool:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Preset", f"Could not write {path}:\n{exc}")
+            return False
+
+    def _save_preset(self):
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if ok and name.strip() and self._write_json(os.path.join(self.presets_dir, name.strip() + ".json"),
+                                                    self.get_settings()):
+            self._rebuild_presets_menu()
+
+    def _delete_preset(self):
+        names = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        if not names:
+            QMessageBox.information(self, "Presets", "No saved presets.")
+            return
+        name, ok = QInputDialog.getItem(self, "Delete preset", "Preset:", names, 0, False)
+        if ok and name:
+            os.remove(os.path.join(self.presets_dir, name + ".json"))
+            self._rebuild_presets_menu()
+
+    def _load_preset_file(self, path: str):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                self.apply_settings(json.load(fh))
+            self.statusBar().showMessage(f"Preset loaded: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Preset", f"Could not read preset:\n{exc}")
+
+    def _import_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import preset", "", "JSON (*.json)")
+        if path:
+            self._load_preset_file(path)
+
+    def _export_preset(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export preset", "preset.json", "JSON (*.json)")
+        if path:
+            self._write_json(path, self.get_settings())
+
+    def _save_defaults(self):
+        if self._write_json(os.path.join(self.presets_dir, "defaults.json"), self.get_settings()):
+            self.statusBar().showMessage("Current settings saved as defaults")
+
+    # ------------------------------------------------------------------ helpers
+    def _browse_dir(self, line: QLineEdit):
+        d = QFileDialog.getExistingDirectory(self, "Output folder", line.text() or os.path.expanduser("~"))
+        if d:
+            line.setText(d)
+            self.controls["output_mode"].setCurrentIndex(1)
+
+    def _apply_chunk_preset(self, idx: int):
+        data = self.chunk_preset.itemData(idx)
+        if data:
+            self.controls["chunk_size"].setValue(data[0])
+            self.controls["overlap"].setValue(data[1])
+
+    def _sync_chunk_preset(self):
+        cur = (self.controls["chunk_size"].value(), self.controls["overlap"].value())
+        self.chunk_preset.blockSignals(True)
+        idx = next((i for i in range(self.chunk_preset.count()) if tuple(self.chunk_preset.itemData(i) or ()) == cur), 0)
+        self.chunk_preset.setCurrentIndex(idx)
+        self.chunk_preset.blockSignals(False)
+
+    def _move_op(self, delta: int):
+        row = self.pipeline_list.currentRow()
+        if row < 0 or not 0 <= row + delta < self.pipeline_list.count():
+            return
+        it = self.pipeline_list.takeItem(row)
+        self.pipeline_list.insertItem(row + delta, it)
+        self.pipeline_list.setCurrentRow(row + delta)
+
+    def open_config(self):
+        path = os.path.join(app_dir(), "config.json")
+        if not os.path.isfile(path):
+            import shutil
+            shutil.copy2(os.path.join(resource_dir(), "config.json"), path)
+        self._open_path(path)
+        self._append_log("INFO", f"Edit {path} and restart the app to pick up changes.")
+
+    def _open_path(self, path: str):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            QMessageBox.information(self, "Open", f"{path}\n\n({exc})")
+
+    def open_output(self):
+        s = self.get_settings()
+        if s["output_mode"] == "custom" and s["output_dir"]:
+            out = s["output_dir"]
+        elif self.files:
+            out = os.path.dirname(self.files[0])
+        else:
+            out = os.getcwd()
+        os.makedirs(out, exist_ok=True)
+        self._open_path(out)
+
+    # ------------------------------------------------------------------ server
+    def refresh_server(self, *_):
+        if self.probe and self.probe.isRunning():
+            return
+        host = self.controls["host"].text().strip() or DEFAULT_SETTINGS["host"]
+        self.server_label.setText(f"Connecting to {host}…")
+        self.server_label.setStyleSheet("color: #666; font-size: 11px;")
+        self.probe = ProbeThread(host)
+        self.probe.done.connect(self._server_probed)
+        self.probe.start()
+
+    def _server_probed(self, version: str, models: List[str], err: str):
+        if err:
+            self.server_label.setText(f"Not reachable: {err}. Start it with `ollama serve`.")
+            self.server_label.setStyleSheet("color: #856404; font-size: 11px;")
+            self.stat_server.setText("offline")
+            return
+        self.models = models
+        self.stat_server.setText(f"Ollama {version}")
+        if not models:
+            self.server_label.setText(f"Ollama {version} connected, but no models installed (`ollama pull qwen2.5`).")
+            self.server_label.setStyleSheet("color: #856404; font-size: 11px;")
+        else:
+            self.server_label.setText(f"Ollama {version} — {len(models)} model(s): " + ", ".join(models[:6])
+                                      + (" …" if len(models) > 6 else ""))
+            self.server_label.setStyleSheet("color: #155724; font-size: 11px;")
+        for ctl in self.op_controls.values():
+            combo: QComboBox = ctl["model"]
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(models)
+            if current and combo.findText(current) < 0:
+                combo.addItem(current)
+            combo.setCurrentText(current or (models[0] if models else ""))
+            combo.blockSignals(False)
+
+    # ------------------------------------------------------------------ queue
+    def add_paths(self, paths: List[str]):
+        added = 0
+        for p in paths:
+            if os.path.isdir(p):
+                for root, _dirs, files in os.walk(p):
+                    for f in sorted(files):
+                        if os.path.splitext(f)[1].lower() in TEXT_EXTENSIONS:
+                            added += self._add_one(os.path.join(root, f))
+            elif os.path.isfile(p):
+                added += self._add_one(p)
+        if added:
+            self.statusBar().showMessage(f"{added} file(s) added — {len(self.files)} in queue")
+
+    def _add_one(self, path: str) -> int:
+        if path in self.files:
+            return 0
+        self.files.append(path)
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        item = QTableWidgetItem(os.path.basename(path))
+        try:
+            item.setToolTip(f"{path}\n{os.path.getsize(path) / 1024:.1f} KB")
+        except OSError:
+            item.setToolTip(path)
+        self.table.setItem(r, 0, item)
+        self.table.setItem(r, 1, QTableWidgetItem("pending"))
+        self.table.setItem(r, 2, QTableWidgetItem(""))
+        self._color_row(r, "pending")
+        return 1
+
+    def _color_row(self, row: int, state: str):
+        for col in range(3):
+            it = self.table.item(row, col)
+            if it:
+                it.setBackground(QColor(_STATUS_COLORS.get(state, "#ffffff")))
+
+    def add_files(self):
+        exts = " ".join(f"*{e}" for e in TEXT_EXTENSIONS)
+        files, _ = QFileDialog.getOpenFileNames(self, "Add text files", "", f"Text files ({exts});;All files (*)")
+        self.add_paths(files)
+
+    def add_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Add folder")
+        if d:
+            self.add_paths([d])
+
+    def remove_selected(self):
+        if self.worker and self.worker.isRunning():
+            return
+        for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
+            self.table.removeRow(r)
+            del self.files[r]
+
+    def clear_queue(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.files.clear()
+        self.table.setRowCount(0)
+
+    # -------------------------------------------------------------- processing
+    def build_pipeline(self, s: Dict) -> Tuple[List[Tuple[str, Dict, List[str]]], List[str]]:
+        """-> (pipeline, problems)"""
+        pipeline, problems = [], []
+        ops = self.operations["operations"]
+        for op_id in s["pipeline"]:
+            if op_id not in s["enabled"]:
+                continue
+            values = dict(s["ops"].get(op_id, {}))
+            if not values.get("model"):
+                problems.append(f"{ops[op_id].get('tab_name', op_id)}: no model selected.")
+            enabled: List[str] = []
+            if op_id != "translation":
+                subs = ops[op_id].get("sub_operations", {})
+                for sid in subs:
+                    if values.get(sid) is True:
+                        enabled.append(sid)
+                tone = values.get("target_tone")
+                if tone and tone != "original" and f"adjust_tone_{tone}" in subs:
+                    enabled.append(f"adjust_tone_{tone}")
+                if not enabled:
+                    problems.append(f"{ops[op_id].get('tab_name', op_id)} is enabled but no task is checked.")
+            pipeline.append((op_id, values, enabled))
+        if not pipeline:
+            problems.append("No operation is checked in the Pipeline tab.")
+        return pipeline, problems
+
+    def start(self):
+        if not self.files:
+            QMessageBox.information(self, "Queue", "Add some text files first.")
+            return
+        s = self.get_settings()
+        pipeline, problems = self.build_pipeline(s)
+        if problems:
+            QMessageBox.warning(self, "Check settings", "\n".join(problems))
+            return
+        if s["output_mode"] == "custom" and not s["output_dir"]:
+            QMessageBox.warning(self, "Check settings", "Choose an output folder or write next to the source files.")
+            return
+        for r in range(self.table.rowCount()):
+            self.table.item(r, 1).setText("pending")
+            self.table.item(r, 2).setText("")
+            self._color_row(r, "pending")
+        self.log.clear()
+        self._chunks = 0
+        self._run_start = time.time()
+        self.total_bar.setRange(0, len(self.files))
+        self.total_bar.setValue(0)
+        self.file_bar.setRange(0, 1)
+        self.file_bar.setValue(0)
+        self.stat_chunks.setText("0")
+        self.stat_speed.setText("--")
+        self._timer.start(1000)
+        names = [self.operations["operations"][p[0]].get("tab_name", p[0]) for p in pipeline]
+        self._append_log("INFO", "Pipeline: " + " → ".join(names))
+        self.worker = Worker(list(self.files), s, self.operations, pipeline)
+        w = self.worker
+        w.log.connect(self._append_log)
+        w.status.connect(self._on_status)
+        w.file_started.connect(self._on_file_started)
+        w.chunk_progress.connect(self._on_chunk)
+        w.file_done.connect(self._on_file_done)
+        w.finished_all.connect(self._on_finished)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.tabs.setEnabled(False)
+        w.start()
+
+    def stop(self):
+        if self.worker:
+            self.worker.request_stop()
+            self.phase_label.setText("Stopping after the current chunk…")
+            self.stop_btn.setEnabled(False)
+
+    def _tick(self):
+        el = time.time() - self._run_start
+        self.stat_elapsed.setText(format_duration(el))
+        if self._chunks and el > 0:
+            self.stat_speed.setText(f"{self._chunks / el * 60:.1f} chunks/min")
+
+    def _on_status(self, text: str):
+        self.phase_label.setText(text)
+        self.statusBar().showMessage(text)
+
+    def _on_file_started(self, i: int):
+        self.table.item(i, 1).setText("running")
+        self._color_row(i, "running")
+        self.table.scrollToItem(self.table.item(i, 0))
+        self.counter_label.setText(f"file {i + 1} / {len(self.files)} — {os.path.basename(self.files[i])}")
+        self.file_bar.setRange(0, 1)
+        self.file_bar.setValue(0)
+
+    def _on_chunk(self, done: int, total: int, phase: str):
+        self.file_bar.setRange(0, max(1, total))
+        self.file_bar.setValue(done)
+        self._chunks += 1
+        self.stat_chunks.setText(str(self._chunks))
+        row = self.total_bar.value()
+        if row < self.table.rowCount():
+            self.table.item(row, 2).setText(f"{done}/{total}")
+
+    def _on_file_done(self, i: int, state: str, stats: Dict):
+        self.table.item(i, 1).setText(state)
+        self._color_row(i, state)
+        if state == "done":
+            self.table.item(i, 2).setText(str(stats.get("chunks", "")))
+        self.total_bar.setValue(self.total_bar.value() + 1)
+
+    def _on_finished(self, ok: int, total: int):
+        self._timer.stop()
+        self._tick()
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.tabs.setEnabled(True)
+        self.phase_label.setText("Finished" if ok == total else "Finished with problems")
+        self.counter_label.setText("")
+        self.statusBar().showMessage(f"Done: {ok}/{total} files")
+        if self.worker:
+            self.worker.wait(10000)
+            self.worker.deleteLater()
+        self.worker = None
+
+    def _append_log(self, level: str, msg: str):
+        color = {"DEBUG": "#888", "INFO": "#2c3e50", "WARNING": "#b8860b", "ERROR": "#c0392b"}.get(level, "#2c3e50")
+        safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        self.log.append(f'<span style="color:{color};">{safe}</span>')
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _about(self):
+        QMessageBox.about(self, f"About {APP_NAME}",
+                          f"<b>{APP_NAME} {APP_VERSION}</b><br>Batch text processing with local LLMs via Ollama: "
+                          "translation, audiobook preparation, book cleanup, paraphrasing.<br><br>"
+                          "<a href='https://github.com/hclivess/ollama-batch-processor'>github.com/hclivess/ollama-batch-processor</a>")
+
+
+# =============================================================================== entry
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    icon = os.path.join(resource_dir(), "icon.ico")
+    if os.path.exists(icon):
+        app.setWindowIcon(QIcon(icon))
+    win = MainWindow()
+    win.show()
+    selftest = os.environ.get("OLLAMA_BATCH_SELFTEST")
+    if selftest:
+        _selftest(win, selftest)
+    sys.exit(app.exec())
+
+
+def _selftest(win: MainWindow, path: str):
+    """CI smoke test. With a reachable server + model: real translation run must succeed.
+    Without a server: the run must fail cleanly with 'not reachable' (exit 0)."""
+    from processor import TextChunker
+    assert len(TextChunker.chunk_text("Hello world. " * 400, 500, 50)) > 5
+    win.apply_settings({"enabled": ["translation"], "chunk_size": 600, "overlap": 60, "overwrite": True,
+                        "timeout": 600, "suffix": "_selftest"})
+    win.op_controls["translation"]["source_language"].setText("English")
+    win.op_controls["translation"]["target_language"].setText("German")
+    win.add_paths([path])
+    mode = {"server": None}
+
+    def probed(version, models, err):
+        mode["server"] = bool(version) and bool(models)
+        if mode["server"]:
+            win.op_controls["translation"]["model"].setCurrentText(models[0])
+            print(f"selftest: server {version}, model {models[0]}", flush=True)
+        else:
+            print(f"selftest: no server ({err or 'no models'}) - expecting a clean failure", flush=True)
+        QTimer.singleShot(200, go)
+
+    def finished(ok, total):
+        expected = 1 if mode["server"] else 0
+        print(f"selftest: finished {ok}/{total} (expected {expected})", flush=True)
+        code = 0 if ok == expected else 1
+        QTimer.singleShot(0, lambda: (win.worker and win.worker.wait(10000), QApplication.exit(code)))
+
+    def go():
+        if not mode["server"]:
+            win.op_controls["translation"]["model"].setCurrentText("selftest-model")
+        win.start()
+        if not win.worker:
+            print("selftest: start refused", flush=True)
+            QApplication.exit(1)
+            return
+        win.worker.log.connect(lambda lvl, m: print(f"selftest[{lvl}]: {m}", flush=True))
+        win.worker.status.connect(lambda m: print(f"selftest: {m}", flush=True))
+        win.worker.finished_all.connect(finished)
+
+    def wait_probe():
+        if win.probe and win.probe.isRunning():
+            QTimer.singleShot(200, wait_probe)
+            return
+        probed(win.stat_server.text().replace("Ollama ", "") if win.models else "", win.models,
+               "" if win.models else win.server_label.text())
+    QTimer.singleShot(300, wait_probe)
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    
-    loop = QEventLoop(app)
-    asyncio.set_event_loop(loop)
-    
-    window = ModularProcessorApp()
-    window.show()
-    
-    with loop:
-        sys.exit(loop.run_forever())
+    main()
