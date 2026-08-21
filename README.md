@@ -76,7 +76,7 @@ Ollama, pulls `qwen2.5:0.5b` and runs a real translation through the frozen buil
   and the stylesheet were loaded from the current directory (broke when started from elsewhere); errors were written
   into the output as `[ERROR: …]` placeholders; the batch continued after Stop; output naming broke for non-`.txt` files;
   no `num_ctx` was set, so long chunks were truncated by Ollama's default 2k context
-- Automatic context-window sizing, keep-alive, timeout, `<think>` stripping, wrapper/prefix cleanup, length sanity check
+- Automatic context-window sizing and an automatic answer-token cap (a looping model can no longer run forever), keep-alive, timeout, `<think>` stripping, wrapper/prefix cleanup, length sanity check
 - Translation continuation uses the previous translation (not the source) as context; chunk boundaries prefer
   paragraph breaks; duplicate removal only affects substantial repeats
 - Input encoding detection (UTF-8 with BOM, UTF-16, cp1250/cp1252 fallback), overwrite guard, `.partial` progress file

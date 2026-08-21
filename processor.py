@@ -179,15 +179,24 @@ class OllamaProcessor:
         manual = int(self.s.get("num_ctx") or 0)
         if manual > 0:
             return manual
-        # ~3 chars per token for prompt, the answer can be as long as the input again; round up to 1k
-        need = int(prompt_chars / 3 * 2.2) + 512
+        # ~3 chars per token; prompt_chars already includes room for an answer as long as the input
+        need = int(prompt_chars / 3) + 512
         return max(2048, ((need + 1023) // 1024) * 1024)
 
-    def chat(self, model: str, system_prompt: str, user_prompt: str, temperature: float) -> str:
+    def _num_predict(self, input_chars: int) -> int:
+        """'unlimited' still gets a generous cap so a degenerate model cannot loop forever"""
+        manual = int(self.s.get("num_predict", -1))
+        if manual > 0:
+            return manual
+        return int(input_chars / 1.5) + 512
+
+    def chat(self, model: str, system_prompt: str, user_prompt: str, temperature: float,
+             input_chars: Optional[int] = None) -> str:
         import ollama
+        input_chars = input_chars if input_chars is not None else len(user_prompt)
         options = {"temperature": float(temperature), "top_p": float(self.s.get("top_p", 0.9)),
-                   "num_predict": int(self.s.get("num_predict", -1)),
-                   "num_ctx": self._num_ctx(len(system_prompt) + len(user_prompt))}
+                   "num_predict": self._num_predict(input_chars),
+                   "num_ctx": self._num_ctx(len(system_prompt) + len(user_prompt) + input_chars)}
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
         parts: List[str] = []
         try:
@@ -237,7 +246,7 @@ class OllamaProcessor:
                 sys_p = prompts["system_continuation"].format(src_lang=src, target_lang=tgt)
                 usr_p = prompts["user_continuation"].format(src_lang=src, target_lang=tgt,
                                                             context_snippet=snippet, chunk=chunk)
-            result = self.chat(model, sys_p, usr_p, temperature)
+            result = self.chat(model, sys_p, usr_p, temperature, len(chunk))
             out.append(result)
             self._account(chunk, result)
             self.progress(i + 1, len(chunks), f"Translating ({src} → {tgt})")
@@ -281,7 +290,7 @@ class OllamaProcessor:
         self.status(f"{op.get('tab_name', op_id)}: {len(enabled)} task(s) with {model} ({len(chunks)} chunks)")
         out: List[str] = []
         for i, (chunk, _ctx, _first) in enumerate(chunks):
-            result = self.chat(model, sys_p, usr_t.format(text=chunk), temperature)
+            result = self.chat(model, sys_p, usr_t.format(text=chunk), temperature, len(chunk))
             out.append(result)
             self._account(chunk, result)
             self.progress(i + 1, len(chunks), op.get("tab_name", op_id))

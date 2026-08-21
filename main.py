@@ -474,7 +474,8 @@ class MainWindow(QMainWindow):
         f2.addRow("Context (num_ctx):", c["num_ctx"])
         c["num_predict"] = QSpinBox()
         c["num_predict"].setRange(-1, 262144)
-        c["num_predict"].setSpecialValueText("unlimited")
+        c["num_predict"].setSpecialValueText("auto")
+        c["num_predict"].setToolTip("Max answer tokens per chunk. auto = generous cap derived from the chunk size")
         f2.addRow("Max tokens:", c["num_predict"])
         c["top_p"] = QDoubleSpinBox()
         c["top_p"].setRange(0.0, 1.0)
@@ -975,7 +976,7 @@ def _selftest(win: MainWindow, path: str):
     from processor import TextChunker
     assert len(TextChunker.chunk_text("Hello world. " * 400, 500, 50)) > 5
     win.apply_settings({"enabled": ["translation"], "chunk_size": 600, "overlap": 60, "overwrite": True,
-                        "timeout": 600, "suffix": "_selftest"})
+                        "timeout": 300, "num_predict": 200, "suffix": "_selftest"})
     win.op_controls["translation"]["source_language"].setText("English")
     win.op_controls["translation"]["target_language"].setText("German")
     win.add_paths([path])
