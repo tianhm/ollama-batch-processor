@@ -67,6 +67,13 @@ The GitHub workflow builds all three platforms on every tag and attaches them to
 Ollama, pulls `qwen2.5:0.5b` and runs a real translation through the frozen build
 (`OLLAMA_BATCH_SELFTEST=<text file>`).
 
+## Changes in 2.0.2
+
+- No partial result files: outputs, step files and presets are written to a temp name and renamed into place only when complete; Stop or a server error removes the progress file
+- Every process the app spawns is killed on quit or crash (never an Ollama server you started yourself)
+- Adding files or folders rejects duplicates ("n already in queue")
+- Natural sort order for folder scans and lists (chapter 2 before chapter 10)
+
 ## Changes in 2.0
 
 - New GUI in the [whisperer](https://github.com/hclivess/whisperer) style: queue with per-file status, live chunk

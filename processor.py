@@ -316,13 +316,37 @@ class OllamaProcessor:
         return os.path.join(folder, f"{stem}{self.s.get('suffix', '_processed')}{ext}")
 
     def partial(self, text: str):
-        """Progress file so a crash / stop never loses finished chunks"""
+        """Progress file (explicit .partial name) so a crash never loses finished chunks; removed on finish,
+        Stop and error - a file under the final name is always complete."""
         if self._partial_path:
             try:
-                with open(self._partial_path, "w", encoding="utf-8") as fh:
-                    fh.write(text)
+                self._write_atomic(self._partial_path, text)
             except OSError:
                 pass
+
+    @staticmethod
+    def _write_atomic(path: str, text: str):
+        """Write to a temp name next to the destination and os.replace when complete."""
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _cleanup_partial(self):
+        if self._partial_path:
+            for p in (self._partial_path, self._partial_path + ".tmp"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        self._partial_path = None
 
     def process_file(self, input_path: str, pipeline: List[Tuple[str, Dict, List[str]]]) -> Dict:
         """pipeline: [(op_id, values, enabled_sub_ops)] -> stats dict"""
@@ -341,28 +365,24 @@ class OllamaProcessor:
         start = time.time()
         self.chunks_done = self.chars_in = self.chars_out = 0
         step_files = []
-        for step, (op_id, values, enabled) in enumerate(pipeline, 1):
-            if self.should_stop():
-                raise ProcessingStopped()
-            if op_id == "translation":
-                text = self.run_translation(text, op_id, values)
-                step_name = self.ops[op_id].get("step_name", "translated")
-            else:
-                text = self.run_combined(text, op_id, values, enabled)
-                step_name = self.ops[op_id].get("step_name") or op_id
-            if self.s.get("save_steps", True) and len(pipeline) > 1:
-                sf = f"{stem}_step{step:02d}_{step_name}{ext}"
-                with open(sf, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                step_files.append(sf)
-                self.log("INFO", f"step {step} saved: {os.path.basename(sf)}")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(text)
         try:
-            os.remove(self._partial_path)
-        except OSError:
-            pass
-        self._partial_path = None
+            for step, (op_id, values, enabled) in enumerate(pipeline, 1):
+                if self.should_stop():
+                    raise ProcessingStopped()
+                if op_id == "translation":
+                    text = self.run_translation(text, op_id, values)
+                    step_name = self.ops[op_id].get("step_name", "translated")
+                else:
+                    text = self.run_combined(text, op_id, values, enabled)
+                    step_name = self.ops[op_id].get("step_name") or op_id
+                if self.s.get("save_steps", True) and len(pipeline) > 1:
+                    sf = f"{stem}_step{step:02d}_{step_name}{ext}"
+                    self._write_atomic(sf, text)
+                    step_files.append(sf)
+                    self.log("INFO", f"step {step} saved: {os.path.basename(sf)}")
+            self._write_atomic(out_path, text)
+        finally:
+            self._cleanup_partial()
         elapsed = time.time() - start
         self.log("INFO", f"written {os.path.basename(out_path)} ({len(text):,} chars, {elapsed:.0f}s)")
         return {"output": out_path, "chunks": self.chunks_done, "chars_in": self.chars_in,

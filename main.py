@@ -8,7 +8,6 @@ but everything else works, and only after a real run when a server with a model 
 """
 import json
 import os
-import subprocess
 import sys
 import time
 import traceback
@@ -28,6 +27,8 @@ from PySide6.QtWidgets import (  # noqa: E402
 from config import (APP_NAME, APP_VERSION, CHUNK_PRESETS, DEFAULT_SETTINGS, TEXT_EXTENSIONS,  # noqa: E402
                     WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH, app_dir, resource_dir)
 from processor import OllamaError, OllamaProcessor, ProcessingStopped, load_operations  # noqa: E402
+from utils import childproc  # noqa: E402
+from utils.naturalsort import natural_key, natural_sorted  # noqa: E402
 
 _BTN = """
     QPushButton { font-size: 14px; font-weight: bold; padding: 8px; background-color: %s; color: %s; border-radius: 5px; }
@@ -91,7 +92,7 @@ class Worker(QThread):
                 ok += 1
                 self.file_done.emit(i, "done", stats)
             except ProcessingStopped:
-                self.log.emit("WARNING", f"{os.path.basename(f)}: stopped (finished chunks kept in .partial file)")
+                self.log.emit("WARNING", f"{os.path.basename(f)}: stopped (no partial output left behind)")
                 self.file_done.emit(i, "stopped", {})
             except OllamaError as exc:
                 self.log.emit("ERROR", f"{os.path.basename(f)}: {exc}")
@@ -504,7 +505,8 @@ class MainWindow(QMainWindow):
     def _rebuild_presets_menu(self):
         m = self.presets_menu
         m.clear()
-        names = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        names = sorted((f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json"),
+                       key=natural_key)
         for name in names:
             m.addAction(name, lambda n=name: self._load_preset_file(os.path.join(self.presets_dir, n + ".json")))
         if names:
@@ -620,8 +622,10 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- presets
     def _write_json(self, path: str, data: Dict) -> bool:
         try:
-            with open(path, "w", encoding="utf-8") as fh:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
             return True
         except Exception as exc:
             QMessageBox.warning(self, "Preset", f"Could not write {path}:\n{exc}")
@@ -634,7 +638,8 @@ class MainWindow(QMainWindow):
             self._rebuild_presets_menu()
 
     def _delete_preset(self):
-        names = sorted(f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json")
+        names = sorted((f[:-5] for f in os.listdir(self.presets_dir) if f.endswith(".json") and f != "defaults.json"),
+                       key=natural_key)
         if not names:
             QMessageBox.information(self, "Presets", "No saved presets.")
             return
@@ -706,9 +711,9 @@ class MainWindow(QMainWindow):
             if sys.platform == "win32":
                 os.startfile(path)  # noqa
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", path])
+                childproc.popen(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                childproc.popen(["xdg-open", path])
         except Exception as exc:
             QMessageBox.information(self, "Open", f"{path}\n\n({exc})")
 
@@ -762,20 +767,34 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ queue
     def add_paths(self, paths: List[str]):
-        added = 0
+        added = dupes = 0
         for p in paths:
             if os.path.isdir(p):
-                for root, _dirs, files in os.walk(p):
-                    for f in sorted(files):
-                        if os.path.splitext(f)[1].lower() in TEXT_EXTENSIONS:
-                            added += self._add_one(os.path.join(root, f))
+                found = []
+                for root, dirs, files in os.walk(p):
+                    dirs.sort(key=natural_key)
+                    found += [os.path.join(root, f) for f in files if os.path.splitext(f)[1].lower() in TEXT_EXTENSIONS]
+                for f in natural_sorted(found):
+                    n = self._add_one(f)
+                    added += n
+                    dupes += 1 - n
             elif os.path.isfile(p):
-                added += self._add_one(p)
-        if added:
-            self.statusBar().showMessage(f"{added} file(s) added — {len(self.files)} in queue")
+                n = self._add_one(p)
+                added += n
+                dupes += 1 - n
+        msg = f"{added} file(s) added — {len(self.files)} in queue"
+        if dupes:
+            msg += f" ({dupes} already in queue)"
+        if added or dupes:
+            self.statusBar().showMessage(msg)
+
+    @staticmethod
+    def _key(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     def _add_one(self, path: str) -> int:
-        if path in self.files:
+        key = self._key(path)
+        if any(self._key(f) == key for f in self.files):
             return 0
         self.files.append(path)
         r = self.table.rowCount()
@@ -958,6 +977,7 @@ class MainWindow(QMainWindow):
 # =============================================================================== entry
 def main():
     app = QApplication(sys.argv)
+    childproc.install_qt_hook(app)
     app.setStyle("Fusion")
     icon = os.path.join(resource_dir(), "icon.ico")
     if os.path.exists(icon):
