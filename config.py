@@ -5,7 +5,7 @@ import os
 import sys
 
 APP_NAME = "ollama-batch-processor"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 WINDOW_MIN_WIDTH = 900
 WINDOW_MIN_HEIGHT = 600
 

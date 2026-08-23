@@ -67,6 +67,14 @@ The GitHub workflow builds all three platforms on every tag and attaches them to
 Ollama, pulls `qwen2.5:0.5b` and runs a real translation through the frozen build
 (`OLLAMA_BATCH_SELFTEST=<text file>`).
 
+## Changes in 2.0.3
+
+- **The Windows taskbar shows the app's own icon.** The taskbar button takes its icon from the process's
+  Application User Model ID rather than from the window, and with none of its own the process was grouped
+  under whatever launched it and wore that program's icon. One is now set before any window exists, and it
+  carries no version number so a pinned button survives an upgrade.
+
+
 ## Changes in 2.0.2
 
 - No partial result files: outputs, step files and presets are written to a temp name and renamed into place only when complete; Stop or a server error removes the progress file
